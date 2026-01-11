@@ -5,93 +5,136 @@ import { Footer } from "@/components/Footer";
 import { HeroSection } from "@/components/HeroSection";
 import { YouTubeInput } from "@/components/YouTubeInput";
 import { NotesDisplay } from "@/components/NotesDisplay";
+import { AuthModal } from "@/components/AuthModal";
+import { HistorySidebar } from "@/components/HistorySidebar";
+import { useAuth } from "@/contexts/AuthContext";
+import { supabase } from "@/integrations/supabase/client";
+import { Note } from "@/types/note";
 import { toast } from "sonner";
 
-// Mock notes data - in production, this would come from an AI API
-const generateMockNotes = (url: string) => ({
-  title: "Complete Guide to Modern Web Development with React",
-  videoUrl: url,
-  duration: "45:32",
-  summary:
-    "This comprehensive video tutorial covers the essential concepts of modern web development using React.js. From setting up your development environment to deploying production-ready applications, you'll learn industry best practices, state management patterns, and performance optimization techniques that are crucial for building scalable web applications.",
-  keyPoints: [
-    "React fundamentals: Components, JSX, and the Virtual DOM",
-    "State management with hooks: useState, useEffect, and custom hooks",
-    "Building reusable component libraries with proper TypeScript typing",
-    "Performance optimization techniques including code splitting and lazy loading",
-    "Best practices for project structure and code organization",
-    "Testing strategies with Jest and React Testing Library",
-  ],
-  sections: [
-    {
-      title: "Introduction to React",
-      timestamp: "0:00",
-      content:
-        "React is a declarative, efficient, and flexible JavaScript library for building user interfaces. It lets you compose complex UIs from small and isolated pieces of code called components. The library was developed by Facebook and is now maintained by Meta and a community of developers.",
-    },
-    {
-      title: "Setting Up Your Development Environment",
-      timestamp: "5:23",
-      content:
-        "Before starting with React, you need to set up your development environment. This includes installing Node.js, npm or yarn, and creating a new React project using Create React App or Vite. Vite is recommended for its faster build times and modern development experience.",
-    },
-    {
-      title: "Understanding Components and Props",
-      timestamp: "12:45",
-      content:
-        "Components are the building blocks of any React application. They accept inputs called props and return React elements describing what should appear on the screen. Components can be written as functions or classes, with functional components being the modern standard.",
-    },
-    {
-      title: "State Management with Hooks",
-      timestamp: "22:10",
-      content:
-        "React Hooks allow you to use state and other React features without writing a class. The useState hook lets you add state to functional components, while useEffect handles side effects like data fetching, subscriptions, or DOM manipulation.",
-    },
-    {
-      title: "Building Production-Ready Applications",
-      timestamp: "35:50",
-      content:
-        "Deploying a React application involves building an optimized production bundle, configuring environment variables, and choosing a hosting platform. Popular options include Vercel, Netlify, and AWS Amplify, each offering different features for different use cases.",
-    },
-    {
-      title: "Conclusion and Next Steps",
-      timestamp: "42:15",
-      content:
-        "After mastering these fundamentals, you can explore advanced topics like server-side rendering with Next.js, state management with Redux or Zustand, and building full-stack applications with backend frameworks. Continue practicing by building real projects.",
-    },
-  ],
-});
-
 const Index = () => {
-  const [notes, setNotes] = useState<ReturnType<typeof generateMockNotes> | null>(null);
+  const { user } = useAuth();
+  const [notes, setNotes] = useState<Note | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
   const handleGenerate = async (url: string) => {
     setIsLoading(true);
     setNotes(null);
 
-    // Simulate API call delay
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-
     try {
-      const generatedNotes = generateMockNotes(url);
-      setNotes(generatedNotes);
+      const { data, error } = await supabase.functions.invoke("generate-notes", {
+        body: { videoUrl: url },
+      });
+
+      if (error) {
+        console.error("Edge function error:", error);
+        toast.error(error.message || "Failed to generate notes");
+        return;
+      }
+
+      if (!data?.success || !data?.notes) {
+        toast.error(data?.error || "Failed to generate notes");
+        return;
+      }
+
+      const generatedNote: Note = {
+        videoUrl: url,
+        title: data.notes.title,
+        duration: data.notes.duration || "Unknown",
+        summary: data.notes.summary,
+        keyPoints: data.notes.keyPoints || [],
+        sections: data.notes.sections || [],
+      };
+
+      setNotes(generatedNote);
       toast.success("Notes generated successfully!");
+
+      // Save to database if user is logged in
+      if (user) {
+        await saveNote(generatedNote);
+      }
     } catch (error) {
+      console.error("Error generating notes:", error);
       toast.error("Failed to generate notes. Please try again.");
     } finally {
       setIsLoading(false);
     }
   };
 
+  const saveNote = async (note: Note) => {
+    if (!user) return;
+
+    try {
+      const { data, error } = await supabase.from("notes").insert({
+        user_id: user.id,
+        video_url: note.videoUrl,
+        video_title: note.title,
+        duration: note.duration,
+        summary: note.summary,
+        key_points: note.keyPoints,
+        sections: note.sections,
+      }).select().single();
+
+      if (error) throw error;
+
+      // Update local note with ID from database
+      setNotes({ ...note, id: data.id, created_at: data.created_at });
+      toast.success("Note saved to your history!");
+    } catch (error) {
+      console.error("Error saving note:", error);
+    }
+  };
+
+  const handleUpdateNote = async (updatedNote: Note) => {
+    setNotes(updatedNote);
+
+    if (user && updatedNote.id) {
+      try {
+        const { error } = await supabase
+          .from("notes")
+          .update({
+            video_title: updatedNote.title,
+            summary: updatedNote.summary,
+            key_points: updatedNote.keyPoints,
+            sections: updatedNote.sections,
+          })
+          .eq("id", updatedNote.id);
+
+        if (error) throw error;
+      } catch (error) {
+        console.error("Error updating note:", error);
+        toast.error("Failed to save changes");
+      }
+    }
+  };
+
+  const handleSelectNote = (note: Note) => {
+    setNotes(note);
+  };
+
   return (
     <div className="min-h-screen gradient-hero flex flex-col">
-      <Header />
+      <Header onOpenHistory={() => setIsHistoryOpen(true)} onOpenAuth={() => setIsAuthOpen(true)} />
 
       <main className="flex-1 px-6 py-12">
         <div className="max-w-6xl mx-auto">
           <HeroSection />
           <YouTubeInput onGenerate={handleGenerate} isLoading={isLoading} />
+
+          {!user && !isLoading && !notes && (
+            <motion.p
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="text-center text-sm text-muted-foreground mt-8"
+            >
+              <button onClick={() => setIsAuthOpen(true)} className="text-primary hover:underline">
+                Sign in
+              </button>{" "}
+              to save notes to your history
+            </motion.p>
+          )}
 
           <AnimatePresence mode="wait">
             {isLoading && (
@@ -127,7 +170,7 @@ const Index = () => {
                 exit={{ opacity: 0 }}
                 className="mt-16"
               >
-                <NotesDisplay notes={notes} />
+                <NotesDisplay notes={notes} onUpdate={handleUpdateNote} />
               </motion.div>
             )}
           </AnimatePresence>
@@ -135,6 +178,13 @@ const Index = () => {
       </main>
 
       <Footer />
+
+      <AuthModal isOpen={isAuthOpen} onClose={() => setIsAuthOpen(false)} />
+      <HistorySidebar
+        isOpen={isHistoryOpen}
+        onClose={() => setIsHistoryOpen(false)}
+        onSelectNote={handleSelectNote}
+      />
     </div>
   );
 };
