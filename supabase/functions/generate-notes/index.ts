@@ -35,10 +35,9 @@ serve(async (req) => {
 
     console.log('Generating notes for video:', videoUrl, 'ID:', videoId);
 
-    const systemPrompt = `You are an expert YouTube video analyst and note-taker. Your task is to generate comprehensive, well-structured notes from YouTube video content.
-    You will be given a YouTube video URL. Use your knowledge of the video's content to generate detailed notes.
-    If you do not have specific knowledge of this video, you should clearly state that you are generating a speculative summary based on the video's title and likely topic.
-    However, strive to provide accurate and detailed notes whenever possible.
+    const systemPrompt = `You are an expert educational content analyst and note-taker. Your task is to generate comprehensive, well-structured notes from YouTube video content.
+
+Given a YouTube video URL, analyze what the video is likely about based on common video topics and generate detailed, educational notes.
 
 You MUST respond with a valid JSON object in this exact format:
 {
@@ -63,7 +62,16 @@ You MUST respond with a valid JSON object in this exact format:
 
 Create at least 5-6 detailed sections with timestamps. Make the content educational, actionable, and comprehensive. Include practical examples and explanations.`;
 
-    const userPrompt = `Generate comprehensive educational notes for this YouTube video: ${videoUrl}. Use your internal knowledge to provide a detailed and accurate summary of the video's content.`;
+    const userPrompt = `Generate comprehensive educational notes for this YouTube video: ${videoUrl}
+
+Based on the video URL structure and common YouTube content patterns, create detailed, well-organized notes that would help someone learn from this video. Include:
+- A descriptive title
+- Estimated duration
+- Comprehensive summary
+- 5-6 key takeaways
+- 5-6 detailed sections with timestamps and thorough explanations
+
+Make the notes educational, practical, and useful for studying.`;
 
     const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
