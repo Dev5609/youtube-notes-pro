@@ -30,7 +30,7 @@ serve(async (req) => {
     }
 
     // Extract video ID from URL
-    const videoIdMatch = videoUrl.match(/(?:youtube\\.com\\/(?:watch\\?v=|embed\\/|v\\/)|youtu\\.be\\/)([a-zA-Z0-9_-]{11})/);
+    const videoIdMatch = videoUrl.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
     const videoId = videoIdMatch ? videoIdMatch[1] : null;
 
     console.log('Generating notes for video:', videoUrl, 'ID:', videoId);
