@@ -19,13 +19,13 @@ const Index = () => {
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  const handleGenerate = async (url: string) => {
+  const handleGenerate = async (url: string, videoType: string) => {
     setIsLoading(true);
     setNotes(null);
 
     try {
       const { data, error } = await supabase.functions.invoke("generate-notes", {
-        body: { videoUrl: url },
+        body: { videoUrl: url, videoType },
       });
 
       if (error) {
@@ -118,7 +118,7 @@ const Index = () => {
     <div className="min-h-screen gradient-hero flex flex-col">
       <Header onOpenHistory={() => setIsHistoryOpen(true)} onOpenAuth={() => setIsAuthOpen(true)} />
 
-      <main className="flex-1 px-6 py-12">
+      <main className="flex-1 px-4 sm:px-6 py-6 sm:py-12">
         <div className="max-w-6xl mx-auto">
           <HeroSection />
           <YouTubeInput onGenerate={handleGenerate} isLoading={isLoading} />
@@ -127,7 +127,7 @@ const Index = () => {
             <motion.p
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              className="text-center text-sm text-muted-foreground mt-8"
+              className="text-center text-xs sm:text-sm text-muted-foreground mt-6 sm:mt-8"
             >
               <button onClick={() => setIsAuthOpen(true)} className="text-primary hover:underline">
                 Sign in
@@ -143,21 +143,23 @@ const Index = () => {
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="mt-16 text-center"
+                className="mt-10 sm:mt-16 text-center"
               >
                 <div className="inline-flex flex-col items-center gap-4">
-                  <div className="relative w-16 h-16">
+                  <div className="relative w-14 h-14 sm:w-16 sm:h-16">
                     <div className="absolute inset-0 rounded-full gradient-primary opacity-20 animate-ping" />
                     <div className="absolute inset-2 rounded-full gradient-primary animate-pulse-glow flex items-center justify-center">
-                      <span className="text-primary-foreground text-xl">✨</span>
+                      <span className="text-primary-foreground text-lg sm:text-xl">✨</span>
                     </div>
                   </div>
-                  <p className="text-muted-foreground font-medium">
-                    AI is analyzing your video...
-                  </p>
-                  <p className="text-sm text-muted-foreground/70">
-                    This usually takes 10-30 seconds
-                  </p>
+                  <div>
+                    <p className="text-muted-foreground font-medium text-sm sm:text-base">
+                      AI is analyzing your video...
+                    </p>
+                    <p className="text-xs sm:text-sm text-muted-foreground/70 mt-1">
+                      Fetching transcript and generating comprehensive notes
+                    </p>
+                  </div>
                 </div>
               </motion.div>
             )}
@@ -168,7 +170,7 @@ const Index = () => {
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="mt-16"
+                className="mt-10 sm:mt-16"
               >
                 <NotesDisplay notes={notes} onUpdate={handleUpdateNote} />
               </motion.div>
