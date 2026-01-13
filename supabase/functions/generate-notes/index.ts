@@ -271,75 +271,38 @@ serve(async (req) => {
 
     const systemPrompt = `${typeInstruction}
 
-Your task is to create COMPREHENSIVE, DETAILED notes from YouTube video content. The notes should be:
-1. Thorough and educational
-2. Well-organized with clear sections
-3. Include specific details, examples, and explanations from the video
-4. Have timestamps where possible
-5. Be suitable for studying and revision
-
-You MUST respond with a valid JSON object in this exact format:
-{
-  "title": "A clear, descriptive title based on the actual video content",
-  "duration": "${videoInfo.duration}",
-  "summary": "A comprehensive 3-4 paragraph summary covering the main topics, key arguments, and conclusions of the video. Be specific and detailed.",
-  "keyPoints": [
-    "First major takeaway with specific details",
-    "Second major takeaway with specific details",
-    "Third major takeaway with specific details",
-    "Fourth major takeaway with specific details",
-    "Fifth major takeaway with specific details",
-    "Sixth major takeaway with specific details",
-    "Seventh major takeaway with specific details"
-  ],
-  "sections": [
-    {
-      "title": "Introduction",
-      "timestamp": "0:00",
-      "content": "Detailed content covering what is discussed in this section..."
-    },
-    {
-      "title": "Section Title Based on Content",
-      "timestamp": "X:XX",
-      "content": "Detailed content for this section with examples and explanations..."
-    }
-  ]
-}
-
-Create at least 8-10 detailed sections with meaningful timestamps. Each section should have substantial content (at least 100 words). Make the notes educational, practical, and comprehensive.`;
+Create comprehensive notes from YouTube video content. Be thorough but concise.`;
 
     let userPrompt = '';
     
     if (transcript && transcript.length > 50) {
-      // Truncate transcript if too long (keep most relevant parts)
-      const maxTranscriptLength = 30000;
+      // Truncate transcript if too long
+      const maxTranscriptLength = 15000;
       let processedTranscript = transcript;
       
       if (transcript.length > maxTranscriptLength) {
-        // Keep beginning and important parts
-        processedTranscript = transcript.substring(0, maxTranscriptLength) + '\n\n[Transcript truncated for processing...]';
+        processedTranscript = transcript.substring(0, maxTranscriptLength) + '\n[Transcript truncated...]';
       }
       
-      userPrompt = `Video Title: "${videoInfo.title}"
-Video Type: ${videoType}
-Video Duration: ${videoInfo.duration}
-Video URL: ${videoUrl}
+      userPrompt = `Video: "${videoInfo.title}"
+Type: ${videoType}
+Duration: ${videoInfo.duration}
 
-FULL TRANSCRIPT:
+TRANSCRIPT:
 ${processedTranscript}
 
-Based on this ACTUAL transcript, create comprehensive notes that accurately reflect the video content. Extract specific quotes, examples, and details from the transcript. Do not make up information - only include what is actually discussed in the transcript.`;
+Create comprehensive notes based on this transcript. Only include information actually in the transcript.`;
     } else {
-      userPrompt = `Video Title: "${videoInfo.title}"
-Video Type: ${videoType}
-Video Duration: ${videoInfo.duration}
-Video URL: ${videoUrl}
+      userPrompt = `Video: "${videoInfo.title}"
+Type: ${videoType}
+Duration: ${videoInfo.duration}
 
-Note: The transcript could not be automatically extracted. Based on the video title and type, generate comprehensive notes that would be appropriate for this type of content. Make it clear that these are generated notes and encourage the user to verify with the actual video.`;
+No transcript available. Create helpful notes based on the video title and type. Note that these are estimated notes.`;
     }
 
     console.log('Sending request to AI with transcript length:', transcript.length);
 
+    // Use tool calling for structured output to avoid JSON parsing issues
     const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -352,6 +315,49 @@ Note: The transcript could not be automatically extracted. Based on the video ti
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'create_notes',
+              description: 'Create structured notes from video content',
+              parameters: {
+                type: 'object',
+                properties: {
+                  title: { 
+                    type: 'string', 
+                    description: 'Clear, descriptive title based on video content' 
+                  },
+                  summary: { 
+                    type: 'string', 
+                    description: 'Comprehensive 2-3 paragraph summary of the video content' 
+                  },
+                  keyPoints: { 
+                    type: 'array', 
+                    items: { type: 'string' },
+                    description: 'Array of 5-7 major takeaways with specific details'
+                  },
+                  sections: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        title: { type: 'string', description: 'Section title' },
+                        timestamp: { type: 'string', description: 'Timestamp like 0:00 or 1:30' },
+                        content: { type: 'string', description: 'Detailed content for this section (50-100 words)' }
+                      },
+                      required: ['title', 'timestamp', 'content']
+                    },
+                    description: 'Array of 5-8 sections covering the video content'
+                  }
+                },
+                required: ['title', 'summary', 'keyPoints', 'sections'],
+                additionalProperties: false
+              }
+            }
+          }
+        ],
+        tool_choice: { type: 'function', function: { name: 'create_notes' } }
       }),
     });
 
@@ -377,40 +383,42 @@ Note: The transcript could not be automatically extracted. Based on the video ti
     }
 
     const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-
-    if (!content) {
-      console.error('No content in AI response:', data);
-      return new Response(
-        JSON.stringify({ error: 'Failed to generate notes content' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    }
-
-    // Parse the JSON from the response
+    
+    // Extract notes from tool call response
     let notes;
     try {
-      // Try to extract JSON from the response
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        notes = JSON.parse(jsonMatch[0]);
+      const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
+      if (toolCall && toolCall.function?.arguments) {
+        notes = JSON.parse(toolCall.function.arguments);
       } else {
-        throw new Error('No JSON found in response');
+        // Fallback to content parsing if no tool call
+        const content = data.choices?.[0]?.message?.content;
+        if (content) {
+          const jsonMatch = content.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            notes = JSON.parse(jsonMatch[0]);
+          }
+        }
+      }
+      
+      if (!notes) {
+        throw new Error('No notes data in response');
       }
     } catch (parseError) {
-      console.error('Failed to parse AI response:', parseError, content);
+      console.error('Failed to parse AI response:', parseError, JSON.stringify(data).substring(0, 500));
       return new Response(
         JSON.stringify({ error: 'Failed to parse notes. Please try again.' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
-    // Add video URL and enhance notes
+    // Add metadata
     notes.videoUrl = videoUrl;
     notes.videoType = videoType;
+    notes.duration = videoInfo.duration;
     notes.hasTranscript = transcript.length > 50;
 
-    console.log('Notes generated successfully with', notes.sections?.length, 'sections');
+    console.log('Notes generated successfully with', notes.sections?.length || 0, 'sections');
     
     return new Response(
       JSON.stringify({ success: true, notes }),
