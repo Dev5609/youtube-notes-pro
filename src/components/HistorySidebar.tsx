@@ -99,7 +99,7 @@ export function HistorySidebar({ isOpen, onClose, onSelectNote }: HistorySidebar
             <div className="p-4 border-b border-border flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <History className="w-5 h-5 text-primary" />
-                <h2 className="font-display font-semibold text-lg">Notes History</h2>
+                <h2 className="font-display font-semibold text-lg">VidBrief History</h2>
               </div>
               <Button variant="ghost" size="icon" onClick={onClose}>
                 <X className="w-5 h-5" />
