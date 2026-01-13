@@ -86,7 +86,7 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
                   {isSignUp ? "Create Account" : "Welcome Back"}
                 </h2>
                 <p className="text-xs sm:text-sm text-muted-foreground mt-1">
-                  {isSignUp ? "Join VidBrief today" : "Sign in to VidBrief"}
+                  {isSignUp ? "Join SummarIQ today" : "Sign in to SummarIQ"}
                 </p>
               </div>
               <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8 sm:h-9 sm:w-9">

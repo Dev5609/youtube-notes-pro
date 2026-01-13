@@ -32,7 +32,7 @@ export function Header({ onOpenHistory, onOpenAuth }: HeaderProps) {
             <BookOpen className="w-4 h-4 sm:w-5 sm:h-5 text-primary-foreground" />
           </div>
           <span className="font-display font-semibold text-lg sm:text-xl text-foreground">
-            VidBrief
+            SummarIQ
           </span>
         </div>
 
