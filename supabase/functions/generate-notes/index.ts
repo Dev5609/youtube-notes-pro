@@ -1,9 +1,12 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 interface TranscriptSegment {
   text: string;
@@ -11,424 +14,528 @@ interface TranscriptSegment {
   duration: number;
 }
 
-// Fetch YouTube transcript using the youtube-transcript library approach
-async function fetchYouTubeTranscript(videoId: string): Promise<{ transcript: string; segments: TranscriptSegment[] }> {
-  console.log('Fetching transcript for video:', videoId);
-  
-  // First, get the video page to extract caption tracks
-  const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const response = await fetch(videoUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-    }
+function formatTimestamp(seconds: number): string {
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  }
+  return `${minutes}:${secs.toString().padStart(2, "0")}`;
+}
+
+function decodeXmlEntities(input: string): string {
+  let s = input
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\n/g, " ");
+
+  // Numeric entities
+  s = s.replace(/&#(\d+);/g, (_, num) => {
+    const code = Number(num);
+    return Number.isFinite(code) ? String.fromCharCode(code) : "";
   });
-  
-  if (!response.ok) {
-    throw new Error('Failed to fetch video page');
+
+  // Trim + collapse whitespace
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function parseAttributes(attrString: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /(\w+)="([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrString))) {
+    attrs[m[1]] = m[2];
   }
-  
-  const html = await response.text();
-  
-  // Extract captions data from the page
-  const captionsMatch = html.match(/"captions":\s*({[^}]+playerCaptionsTracklistRenderer[^}]+})/);
-  if (!captionsMatch) {
-    // Try alternative pattern
-    const altMatch = html.match(/playerCaptionsTracklistRenderer.*?captionTracks.*?\[(.*?)\]/s);
-    if (!altMatch) {
-      throw new Error('No captions available for this video');
+  return attrs;
+}
+
+function parseStartSecondsFromUrl(videoUrl: string): number {
+  try {
+    const u = new URL(videoUrl);
+    const t = u.searchParams.get("t") || u.searchParams.get("start");
+    if (!t) return 0;
+
+    // supports: 1706, 1706s, 1h2m3s
+    if (/^\d+$/.test(t)) return Number(t);
+    if (/^\d+s$/.test(t)) return Number(t.slice(0, -1));
+
+    const h = t.match(/(\d+)h/);
+    const m = t.match(/(\d+)m/);
+    const s = t.match(/(\d+)s/);
+
+    return (h ? Number(h[1]) * 3600 : 0) + (m ? Number(m[1]) * 60 : 0) + (s ? Number(s[1]) : 0);
+  } catch {
+    return 0;
+  }
+}
+
+async function listCaptionTracks(videoId: string): Promise<Array<{ lang: string; name?: string }>> {
+  const listUrls = [
+    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}`,
+    `https://video.google.com/timedtext?type=list&v=${videoId}`,
+  ];
+
+  for (const url of listUrls) {
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" },
+    });
+
+    const xml = await res.text();
+
+    // When no tracks exist, YouTube returns an empty body or very small XML.
+    if (!res.ok || xml.length < 20) continue;
+
+    const tracks: Array<{ lang: string; name?: string }> = [];
+    const trackRe = /<track\b([^/>]*)\/>/g;
+    let m: RegExpExecArray | null;
+    while ((m = trackRe.exec(xml))) {
+      const attrs = parseAttributes(m[1]);
+      const lang = attrs.lang_code || attrs.lang || "";
+      if (!lang) continue;
+      const name = attrs.name ? decodeXmlEntities(attrs.name) : undefined;
+      tracks.push({ lang, name });
     }
+
+    if (tracks.length > 0) return tracks;
   }
-  
-  // Extract caption track URL
-  const captionUrlMatch = html.match(/"baseUrl":\s*"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
-  if (!captionUrlMatch) {
-    throw new Error('Could not find caption URL');
+
+  return [];
+}
+
+async function fetchTranscriptViaTimedText(
+  videoId: string,
+): Promise<{ transcript: string; segments: TranscriptSegment[]; lang?: string }> {
+  console.log("Fetching caption track list for:", videoId);
+  const tracks = await listCaptionTracks(videoId);
+
+  if (!tracks.length) {
+    throw new Error("No captions available for this video");
   }
-  
-  let captionUrl = captionUrlMatch[1].replace(/\\u0026/g, '&');
-  
-  // Fetch the captions in JSON format
-  captionUrl += '&fmt=json3';
-  
-  console.log('Fetching captions from:', captionUrl.substring(0, 100) + '...');
-  
-  const captionResponse = await fetch(captionUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    }
-  });
-  
-  if (!captionResponse.ok) {
-    throw new Error('Failed to fetch captions');
-  }
-  
-  const captionData = await captionResponse.json();
-  
-  if (!captionData.events) {
-    throw new Error('Invalid caption data format');
-  }
-  
-  const segments: TranscriptSegment[] = [];
-  let fullTranscript = '';
-  
-  for (const event of captionData.events) {
-    if (event.segs) {
-      const text = event.segs.map((seg: { utf8?: string }) => seg.utf8 || '').join('').trim();
-      if (text) {
-        segments.push({
-          text,
-          start: event.tStartMs / 1000,
-          duration: (event.dDurationMs || 0) / 1000
-        });
-        fullTranscript += text + ' ';
+
+  const preferred = tracks.find((t) => t.lang.toLowerCase().startsWith("en")) || tracks[0];
+
+  const baseUrls = [
+    "https://www.youtube.com/api/timedtext",
+    "https://video.google.com/timedtext",
+  ];
+
+  let lastErr: unknown;
+  for (const base of baseUrls) {
+    const url = new URL(base);
+    url.searchParams.set("v", videoId);
+    url.searchParams.set("lang", preferred.lang);
+    // srv3 returns richer data in many cases, but XML still works fine; keep it simple
+    // url.searchParams.set("fmt", "srv3");
+    if (preferred.name) url.searchParams.set("name", preferred.name);
+
+    console.log("Fetching transcript from:", url.toString());
+    try {
+      const res = await fetch(url.toString(), {
+        headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9" },
+      });
+      const xml = await res.text();
+
+      if (!res.ok || xml.length < 20) {
+        lastErr = new Error(`Timedtext fetch failed (${res.status})`);
+        continue;
       }
+
+      const segments: TranscriptSegment[] = [];
+      let full = "";
+
+      const textRe = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
+      let m: RegExpExecArray | null;
+      while ((m = textRe.exec(xml))) {
+        const attrs = parseAttributes(m[1]);
+        const start = Number(attrs.start || 0);
+        const dur = Number(attrs.dur || 0);
+        const text = decodeXmlEntities(m[2] || "");
+        if (!text) continue;
+        segments.push({ text, start, duration: dur });
+        full += text + " ";
+      }
+
+      if (!segments.length) {
+        lastErr = new Error("No transcript segments parsed");
+        continue;
+      }
+
+      console.log("Transcript fetched:", { lang: preferred.lang, segments: segments.length, length: full.length });
+      return { transcript: full.trim(), segments, lang: preferred.lang };
+    } catch (e) {
+      lastErr = e;
     }
   }
-  
-  console.log('Transcript fetched, length:', fullTranscript.length, 'segments:', segments.length);
-  
-  return { transcript: fullTranscript.trim(), segments };
+
+  throw (lastErr instanceof Error ? lastErr : new Error("Failed to fetch transcript"));
 }
 
-// Fallback: Use supadata API for transcripts
-async function fetchTranscriptWithSupadata(videoId: string): Promise<{ transcript: string; segments: TranscriptSegment[] }> {
-  console.log('Trying supadata API for video:', videoId);
-  
-  const response = await fetch(`https://api.supadata.ai/v1/youtube/transcript?video_id=${videoId}&text=true`, {
+function buildTimestampedTranscript(segments: TranscriptSegment[], groupSize = 12): string {
+  const blocks: string[] = [];
+  for (let i = 0; i < segments.length; i += groupSize) {
+    const group = segments.slice(i, i + groupSize);
+    if (!group.length) continue;
+    const start = group[0].start;
+    const text = group.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    blocks.push(`[${formatTimestamp(start)}] ${text}`);
+  }
+  return blocks.join("\n");
+}
+
+function splitIntoChunks(text: string, maxChars: number, maxChunks: number): string[] {
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length && chunks.length < maxChunks) {
+    const slice = text.slice(i, i + maxChars);
+    chunks.push(slice);
+    i += maxChars;
+  }
+  return chunks;
+}
+
+function extractJsonFromText(input: string): string | null {
+  const fenced = input.match(/```json\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) return fenced[1].trim();
+
+  const firstBrace = input.indexOf("{");
+  const lastBrace = input.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) return input.slice(firstBrace, lastBrace + 1);
+
+  return null;
+}
+
+function parseJsonLenient<T>(input: string): T {
+  const raw = extractJsonFromText(input) ?? input;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    // Remove trailing commas
+    const cleaned = raw.replace(/,\s*([}\]])/g, "$1");
+    return JSON.parse(cleaned) as T;
+  }
+}
+
+async function callAiJson<T>(args: {
+  lovableApiKey: string;
+  model: string;
+  system: string;
+  user: string;
+  schemaName: string;
+  schema: Record<string, unknown>;
+  maxCompletionTokens: number;
+}): Promise<T> {
+  const { lovableApiKey, model, system, user, schemaName, schema, maxCompletionTokens } = args;
+
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    max_completion_tokens: maxCompletionTokens,
+    // OpenAI-compatible structured output. If the gateway/model ignores it, we still parse leniently.
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: schemaName,
+        schema,
+        strict: true,
+      },
+    },
+  };
+
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    method: "POST",
     headers: {
-      'Accept': 'application/json',
-    }
+      Authorization: `Bearer ${lovableApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
   });
-  
-  if (!response.ok) {
-    throw new Error('Supadata API failed');
+
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "");
+    console.error("AI gateway error:", res.status, errorText);
+
+    if (res.status === 429) throw new Error("Rate limit exceeded. Please try again in a moment.");
+    if (res.status === 402) throw new Error("Usage limit reached. Please add credits to continue.");
+
+    throw new Error("Failed to generate notes. Please try again.");
   }
-  
-  const data = await response.json();
-  
-  if (data.transcript) {
-    return { 
-      transcript: data.transcript, 
-      segments: data.segments || [] 
-    };
+
+  const data = await res.json();
+  const content = data?.choices?.[0]?.message?.content;
+
+  if (typeof content !== "string" || !content.trim()) {
+    console.error("Empty AI response:", JSON.stringify(data).slice(0, 800));
+    throw new Error("AI returned an empty response.");
   }
-  
-  throw new Error('No transcript in response');
+
+  return parseJsonLenient<T>(content);
 }
 
-// Extract video info (title) from YouTube
+// Extract video info (title + duration) from YouTube HTML.
 async function getVideoInfo(videoId: string): Promise<{ title: string; duration: string }> {
   try {
     const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      }
+      headers: { "User-Agent": UA },
     });
-    
+
     const html = await response.text();
-    
-    // Extract title
+
     const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-    let title = titleMatch ? titleMatch[1].replace(' - YouTube', '').trim() : 'YouTube Video';
-    
-    // Extract duration from player response
+    const title = titleMatch ? titleMatch[1].replace(" - YouTube", "").trim() : "YouTube Video";
+
     const durationMatch = html.match(/"lengthSeconds":"(\d+)"/);
-    let duration = 'Unknown';
+    let duration = "Unknown";
     if (durationMatch) {
       const seconds = parseInt(durationMatch[1]);
       const hours = Math.floor(seconds / 3600);
       const minutes = Math.floor((seconds % 3600) / 60);
       const secs = seconds % 60;
-      if (hours > 0) {
-        duration = `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-      } else {
-        duration = `${minutes}:${secs.toString().padStart(2, '0')}`;
-      }
+      duration = hours > 0
+        ? `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`
+        : `${minutes}:${secs.toString().padStart(2, "0")}`;
     }
-    
+
     return { title, duration };
   } catch (error) {
-    console.error('Error getting video info:', error);
-    return { title: 'YouTube Video', duration: 'Unknown' };
+    console.error("Error getting video info:", error);
+    return { title: "YouTube Video", duration: "Unknown" };
   }
-}
-
-function formatTimestamp(seconds: number): string {
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const secs = Math.floor(seconds % 60);
-  
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  }
-  return `${minutes}:${secs.toString().padStart(2, '0')}`;
 }
 
 serve(async (req) => {
-  if (req.method === 'OPTIONS') {
+  if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    const { videoUrl, videoType = 'General' } = await req.json();
+    const { videoUrl, videoType = "General" } = await req.json();
 
     if (!videoUrl) {
-      return new Response(
-        JSON.stringify({ error: 'Video URL is required' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      return new Response(JSON.stringify({ error: "Video URL is required" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
+    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) {
-      console.error('LOVABLE_API_KEY not configured');
-      return new Response(
-        JSON.stringify({ error: 'AI service not configured' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      console.error("LOVABLE_API_KEY not configured");
+      return new Response(JSON.stringify({ error: "AI service not configured" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
     // Extract video ID from URL
-    const videoIdMatch = videoUrl.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+    const videoIdMatch = videoUrl.match(
+      /(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+    );
     const videoId = videoIdMatch ? videoIdMatch[1] : null;
 
     if (!videoId) {
-      return new Response(
-        JSON.stringify({ error: 'Invalid YouTube URL' }),
-        { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      return new Response(JSON.stringify({ error: "Invalid YouTube URL" }), {
+        status: 400,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    console.log('Processing video:', videoId, 'Type:', videoType);
+    const startSeconds = parseStartSecondsFromUrl(videoUrl);
+    console.log("Processing video:", { videoId, videoType, startSeconds });
 
-    // Get video info
     const videoInfo = await getVideoInfo(videoId);
-    console.log('Video info:', videoInfo);
+    console.log("Video info:", videoInfo);
 
-    // Try to fetch transcript
-    let transcript = '';
+    // Transcript
+    let transcript = "";
     let segments: TranscriptSegment[] = [];
-    
+    let transcriptLang: string | undefined;
+
     try {
-      const result = await fetchYouTubeTranscript(videoId);
-      transcript = result.transcript;
-      segments = result.segments;
-    } catch (error) {
-      console.log('Primary transcript fetch failed, trying fallback...', error);
-      try {
-        const result = await fetchTranscriptWithSupadata(videoId);
-        transcript = result.transcript;
-        segments = result.segments;
-      } catch (fallbackError) {
-        console.log('All transcript methods failed:', fallbackError);
+      const t = await fetchTranscriptViaTimedText(videoId);
+      transcript = t.transcript;
+      segments = t.segments;
+      transcriptLang = t.lang;
+    } catch (e) {
+      console.error("Transcript fetch failed:", e);
+    }
+
+    // Apply timestamp offset if URL includes t=...
+    if (startSeconds > 0 && segments.length) {
+      const filtered = segments.filter((s) => s.start >= startSeconds);
+      if (filtered.length) {
+        segments = filtered;
+        transcript = filtered.map((s) => s.text).join(" ");
       }
     }
 
-    if (!transcript || transcript.length < 50) {
-      console.log('No transcript available, generating based on video info only');
+    const hasTranscript = transcript.trim().length > 200 && segments.length > 10;
+    if (!hasTranscript) {
+      return new Response(
+        JSON.stringify({
+          error:
+            "Could not fetch captions/transcript for this video. Please try a video with captions enabled.",
+        }),
+        { status: 422, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
     }
 
-    // Build context-aware prompt based on video type
     const typePrompts: Record<string, string> = {
-      'Academic Lecture': `You are an expert academic note-taker. Create comprehensive lecture notes suitable for university students. Include:
-- Key concepts and definitions
-- Theories and frameworks discussed
-- Examples and case studies
-- Important dates, names, and citations
-- Potential exam topics
-- Questions for further study`,
-      'Tutorial': `You are an expert technical writer. Create step-by-step tutorial notes. Include:
-- Prerequisites and requirements
-- Step-by-step instructions
-- Code snippets or commands if applicable
-- Common pitfalls and troubleshooting tips
-- Best practices
-- Resources for further learning`,
-      'Motivational': `You are an inspirational content summarizer. Create uplifting and actionable notes. Include:
-- Core message and theme
-- Key quotes and memorable moments
-- Action items and takeaways
-- Personal reflection prompts
-- Related resources or books mentioned`,
-      'Review Session': `You are an exam prep specialist. Create revision-focused notes. Include:
-- Main topics covered
-- Key formulas, definitions, or concepts
-- Practice questions or problems
-- Memory aids and mnemonics
-- Areas that need more review
-- Exam tips mentioned`,
-      'Q&A Format': `You are a Q&A summarizer. Create organized Q&A notes. Include:
-- List of questions asked
-- Detailed answers provided
-- Follow-up points discussed
-- Unanswered questions for research
-- Key insights from the discussion`,
-      'General': `You are a comprehensive note-taker. Create well-organized notes covering all important aspects of the video.`
+      "Academic Lecture":
+        "You are an expert academic note-taker. Produce university-grade notes with precise definitions, clear structure, and high fidelity to the transcript.",
+      Tutorial:
+        "You are an expert technical writer. Produce step-by-step tutorial notes with prerequisites, steps, pitfalls, and best practices strictly from the transcript.",
+      Motivational:
+        "You are an inspirational content summarizer. Produce actionable notes, key themes, and meaningful quotes strictly from the transcript.",
+      "Review Session":
+        "You are an exam prep specialist. Produce revision-focused notes, formulas/definitions, practice prompts, and common mistakes strictly from the transcript.",
+      "Q&A Format":
+        "You are a Q&A summarizer. Extract questions and answers, key insights, and unresolved questions strictly from the transcript.",
+      General:
+        "You are a comprehensive note-taker. Produce well-organized notes strictly from the transcript.",
     };
 
-    const typeInstruction = typePrompts[videoType] || typePrompts['General'];
+    const systemPrompt = `${typePrompts[videoType] || typePrompts.General}\n\nOUTPUT REQUIREMENTS:\n- Only use information present in the provided transcript.\n- If unsure, say so briefly in the section content.\n- Use clear headings and tight, information-dense language.\n- Include timestamps in each section based on the transcript (mm:ss or h:mm:ss).`;
 
-    const systemPrompt = `${typeInstruction}
+    const timestampedTranscript = buildTimestampedTranscript(segments, 12);
 
-Create comprehensive notes from YouTube video content. Be thorough but concise.`;
+    // If transcript is long, compress it first with chunk summaries, then synthesize final notes.
+    const DIRECT_MAX_CHARS = 22000;
+    const CHUNK_CHARS = 18000;
+    const MAX_CHUNKS = 6;
 
-    let userPrompt = '';
-    
-    if (transcript && transcript.length > 50) {
-      // Truncate transcript if too long
-      const maxTranscriptLength = 15000;
-      let processedTranscript = transcript;
-      
-      if (transcript.length > maxTranscriptLength) {
-        processedTranscript = transcript.substring(0, maxTranscriptLength) + '\n[Transcript truncated...]';
-      }
-      
-      userPrompt = `Video: "${videoInfo.title}"
-Type: ${videoType}
-Duration: ${videoInfo.duration}
-
-TRANSCRIPT:
-${processedTranscript}
-
-Create comprehensive notes based on this transcript. Only include information actually in the transcript.`;
-    } else {
-      userPrompt = `Video: "${videoInfo.title}"
-Type: ${videoType}
-Duration: ${videoInfo.duration}
-
-No transcript available. Create helpful notes based on the video title and type. Note that these are estimated notes.`;
-    }
-
-    console.log('Sending request to AI with transcript length:', transcript.length);
-
-    // Use tool calling for structured output to avoid JSON parsing issues
-    const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${LOVABLE_API_KEY}`,
-        'Content-Type': 'application/json',
+    const finalSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["title", "summary", "keyPoints", "sections"],
+      properties: {
+        title: { type: "string" },
+        summary: { type: "string" },
+        keyPoints: { type: "array", items: { type: "string" } },
+        sections: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["title", "timestamp", "content"],
+            properties: {
+              title: { type: "string" },
+              timestamp: { type: "string" },
+              content: { type: "string" },
+            },
+          },
+        },
       },
-      body: JSON.stringify({
-        model: 'google/gemini-2.5-flash',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        tools: [
-          {
-            type: 'function',
-            function: {
-              name: 'create_notes',
-              description: 'Create structured notes from video content',
-              parameters: {
-                type: 'object',
-                properties: {
-                  title: { 
-                    type: 'string', 
-                    description: 'Clear, descriptive title based on video content' 
-                  },
-                  summary: { 
-                    type: 'string', 
-                    description: 'Comprehensive 2-3 paragraph summary of the video content' 
-                  },
-                  keyPoints: { 
-                    type: 'array', 
-                    items: { type: 'string' },
-                    description: 'Array of 5-7 major takeaways with specific details'
-                  },
-                  sections: {
-                    type: 'array',
-                    items: {
-                      type: 'object',
-                      properties: {
-                        title: { type: 'string', description: 'Section title' },
-                        timestamp: { type: 'string', description: 'Timestamp like 0:00 or 1:30' },
-                        content: { type: 'string', description: 'Detailed content for this section (50-100 words)' }
-                      },
-                      required: ['title', 'timestamp', 'content']
-                    },
-                    description: 'Array of 5-8 sections covering the video content'
-                  }
-                },
-                required: ['title', 'summary', 'keyPoints', 'sections'],
-                additionalProperties: false
-              }
-            }
-          }
-        ],
-        tool_choice: { type: 'function', function: { name: 'create_notes' } }
-      }),
+    } as const;
+
+    const chunkSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["chunkSummary", "chunkKeyPoints"],
+      properties: {
+        chunkSummary: { type: "string" },
+        chunkKeyPoints: { type: "array", items: { type: "string" } },
+      },
+    } as const;
+
+    console.log("Transcript stats:", {
+      lang: transcriptLang,
+      chars: timestampedTranscript.length,
+      segments: segments.length,
     });
 
-    if (!response.ok) {
-      if (response.status === 429) {
-        return new Response(
-          JSON.stringify({ error: 'Rate limit exceeded. Please try again in a moment.' }),
-          { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+    let synthesisInput = "";
+
+    if (timestampedTranscript.length <= DIRECT_MAX_CHARS) {
+      synthesisInput = `VIDEO: ${videoInfo.title}\nTYPE: ${videoType}\nDURATION: ${videoInfo.duration}\nSTART_OFFSET: ${startSeconds ? formatTimestamp(startSeconds) : "0:00"}\n\nTRANSCRIPT (timestamped):\n${timestampedTranscript}`;
+    } else {
+      const chunks = splitIntoChunks(timestampedTranscript, CHUNK_CHARS, MAX_CHUNKS);
+      console.log("Transcript is long; summarizing chunks:", { chunks: chunks.length });
+
+      const chunkSummaries: Array<{ chunkSummary: string; chunkKeyPoints: string[] }> = [];
+      for (let i = 0; i < chunks.length; i++) {
+        console.log(`Summarizing chunk ${i + 1}/${chunks.length}...`);
+        const chunkNotes = await callAiJson<{ chunkSummary: string; chunkKeyPoints: string[] }>({
+          lovableApiKey: LOVABLE_API_KEY,
+          model: "openai/gpt-5-nano",
+          system:
+            "Summarize this transcript chunk faithfully. Only use what is present. Keep it dense and factual.",
+          user: `CHUNK ${i + 1}/${chunks.length} (timestamped transcript):\n${chunks[i]}`,
+          schemaName: "chunk_notes",
+          schema: chunkSchema as unknown as Record<string, unknown>,
+          maxCompletionTokens: 900,
+        });
+        chunkSummaries.push(chunkNotes);
       }
-      if (response.status === 402) {
-        return new Response(
-          JSON.stringify({ error: 'Usage limit reached. Please add credits to continue.' }),
-          { status: 402, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-      const errorText = await response.text();
-      console.error('AI gateway error:', response.status, errorText);
-      return new Response(
-        JSON.stringify({ error: 'Failed to generate notes. Please try again.' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+
+      const combined = chunkSummaries
+        .map(
+          (c, i) =>
+            `CHUNK ${i + 1}:\nSUMMARY: ${c.chunkSummary}\nKEY POINTS:\n- ${c.chunkKeyPoints.join("\n- ")}`,
+        )
+        .join("\n\n---\n\n");
+
+      synthesisInput = `VIDEO: ${videoInfo.title}\nTYPE: ${videoType}\nDURATION: ${videoInfo.duration}\nSTART_OFFSET: ${startSeconds ? formatTimestamp(startSeconds) : "0:00"}\n\nYou will generate final notes from these chunk summaries (derived from the transcript).\n\nCHUNK SUMMARIES:\n${combined}`;
     }
 
-    const data = await response.json();
-    
-    // Extract notes from tool call response
-    let notes;
-    try {
-      const toolCall = data.choices?.[0]?.message?.tool_calls?.[0];
-      if (toolCall && toolCall.function?.arguments) {
-        notes = JSON.parse(toolCall.function.arguments);
-      } else {
-        // Fallback to content parsing if no tool call
-        const content = data.choices?.[0]?.message?.content;
-        if (content) {
-          const jsonMatch = content.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            notes = JSON.parse(jsonMatch[0]);
-          }
-        }
-      }
-      
-      if (!notes) {
-        throw new Error('No notes data in response');
-      }
-    } catch (parseError) {
-      console.error('Failed to parse AI response:', parseError, JSON.stringify(data).substring(0, 500));
-      return new Response(
-        JSON.stringify({ error: 'Failed to parse notes. Please try again.' }),
-        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+    console.log("Sending synthesis request to AI...");
+    const notes = await callAiJson<{
+      title: string;
+      summary: string;
+      keyPoints: string[];
+      sections: Array<{ title: string; timestamp: string; content: string }>;
+    }>({
+      lovableApiKey: LOVABLE_API_KEY,
+      model: "openai/gpt-5-mini",
+      system: systemPrompt,
+      user: `${synthesisInput}\n\nCreate comprehensive notes. Ensure JSON matches the schema exactly.`,
+      schemaName: "video_notes",
+      schema: finalSchema as unknown as Record<string, unknown>,
+      maxCompletionTokens: 2400,
+    });
+
+    // Basic validation
+    if (!notes?.title || !notes?.summary || !Array.isArray(notes.keyPoints) || !Array.isArray(notes.sections)) {
+      console.error("AI notes failed validation:", JSON.stringify(notes).slice(0, 800));
+      return new Response(JSON.stringify({ error: "Failed to generate structured notes." }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    // Add metadata
-    notes.videoUrl = videoUrl;
-    notes.videoType = videoType;
-    notes.duration = videoInfo.duration;
-    notes.hasTranscript = transcript.length > 50;
+    const responseNotes = {
+      ...notes,
+      videoUrl,
+      videoType,
+      duration: videoInfo.duration,
+      hasTranscript: true,
+      transcriptLang: transcriptLang || "unknown",
+      startOffsetSeconds: startSeconds,
+    };
 
-    console.log('Notes generated successfully with', notes.sections?.length || 0, 'sections');
-    
-    return new Response(
-      JSON.stringify({ success: true, notes }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    console.log("Notes generated successfully:", {
+      title: notes.title,
+      sections: notes.sections?.length ?? 0,
+      keyPoints: notes.keyPoints?.length ?? 0,
+    });
+
+    return new Response(JSON.stringify({ success: true, notes: responseNotes }), {
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   } catch (error) {
-    console.error('Error generating notes:', error);
-    return new Response(
-      JSON.stringify({ error: error instanceof Error ? error.message : 'Failed to generate notes' }),
-      { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-    );
+    console.error("Error generating notes:", error);
+    const message = error instanceof Error ? error.message : "Failed to generate notes";
+    return new Response(JSON.stringify({ error: message }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });
