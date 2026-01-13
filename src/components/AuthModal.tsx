@@ -81,9 +81,14 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
         >
           <div className="p-4 sm:p-6">
             <div className="flex items-center justify-between mb-4 sm:mb-6">
-              <h2 className="text-xl sm:text-2xl font-display font-bold text-foreground">
-                {isSignUp ? "Create Account" : "Welcome Back"}
-              </h2>
+              <div>
+                <h2 className="text-xl sm:text-2xl font-display font-bold text-foreground">
+                  {isSignUp ? "Create Account" : "Welcome Back"}
+                </h2>
+                <p className="text-xs sm:text-sm text-muted-foreground mt-1">
+                  {isSignUp ? "Join VidBrief today" : "Sign in to VidBrief"}
+                </p>
+              </div>
               <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8 sm:h-9 sm:w-9">
                 <X className="w-4 h-4 sm:w-5 sm:h-5" />
               </Button>

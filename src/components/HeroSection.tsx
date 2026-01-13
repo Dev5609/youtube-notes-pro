@@ -27,7 +27,7 @@ export function HeroSection() {
 
       <h1 className="text-3xl sm:text-4xl md:text-5xl lg:text-6xl font-display font-bold text-foreground mb-3 sm:mb-4 leading-tight">
         Learn Smarter with{" "}
-        <span className="text-gradient">NotesGPT</span>
+        <span className="text-gradient">VidBrief</span>
       </h1>
 
       <p className="text-base sm:text-lg text-muted-foreground max-w-2xl mx-auto mb-6 sm:mb-8 px-4">

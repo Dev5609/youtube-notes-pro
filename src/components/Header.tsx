@@ -1,6 +1,7 @@
 import { motion } from "framer-motion";
 import { BookOpen, History, User, LogOut, Menu } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
+import { OnlineUsers } from "./OnlineUsers";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import {
@@ -31,12 +32,14 @@ export function Header({ onOpenHistory, onOpenAuth }: HeaderProps) {
             <BookOpen className="w-4 h-4 sm:w-5 sm:h-5 text-primary-foreground" />
           </div>
           <span className="font-display font-semibold text-lg sm:text-xl text-foreground">
-            NotesGPT
+            VidBrief
           </span>
         </div>
 
         {/* Desktop Navigation */}
-        <div className="hidden sm:flex items-center gap-2">
+        <div className="hidden sm:flex items-center gap-3">
+          <OnlineUsers />
+          
           {user && (
             <Button
               variant="ghost"
@@ -80,6 +83,7 @@ export function Header({ onOpenHistory, onOpenAuth }: HeaderProps) {
 
         {/* Mobile Navigation */}
         <div className="flex sm:hidden items-center gap-2">
+          <OnlineUsers />
           <ThemeToggle />
           
           <DropdownMenu>

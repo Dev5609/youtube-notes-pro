@@ -5,6 +5,7 @@ import { Footer } from "@/components/Footer";
 import { HeroSection } from "@/components/HeroSection";
 import { YouTubeInput } from "@/components/YouTubeInput";
 import { NotesDisplay } from "@/components/NotesDisplay";
+import { LoadingProgress } from "@/components/LoadingProgress";
 import { AuthModal } from "@/components/AuthModal";
 import { HistorySidebar } from "@/components/HistorySidebar";
 import { useAuth } from "@/contexts/AuthContext";
@@ -143,24 +144,8 @@ const Index = () => {
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
-                className="mt-10 sm:mt-16 text-center"
               >
-                <div className="inline-flex flex-col items-center gap-4">
-                  <div className="relative w-14 h-14 sm:w-16 sm:h-16">
-                    <div className="absolute inset-0 rounded-full gradient-primary opacity-20 animate-ping" />
-                    <div className="absolute inset-2 rounded-full gradient-primary animate-pulse-glow flex items-center justify-center">
-                      <span className="text-primary-foreground text-lg sm:text-xl">✨</span>
-                    </div>
-                  </div>
-                  <div>
-                    <p className="text-muted-foreground font-medium text-sm sm:text-base">
-                      AI is analyzing your video...
-                    </p>
-                    <p className="text-xs sm:text-sm text-muted-foreground/70 mt-1">
-                      Fetching transcript and generating comprehensive notes
-                    </p>
-                  </div>
-                </div>
+                <LoadingProgress isLoading={isLoading} />
               </motion.div>
             )}
 
