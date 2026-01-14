@@ -61,32 +61,153 @@ function parseStartSecondsFromUrl(videoUrl: string): number {
   }
 }
 
-// Fetch transcript directly from YouTube video page HTML
-async function fetchTranscriptFromPage(videoId: string): Promise<{ 
-  transcript: string; 
-  segments: TranscriptSegment[]; 
+// Fetch transcript from YouTube.
+// Strategy:
+// 1) Fetch the watch page HTML (with consent-bypass hints) and parse ytInitialPlayerResponse.
+// 2) If captions are missing, fall back to YouTube's internal "youtubei/v1/player" (Innertube) using keys embedded in the HTML.
+
+function extractBalancedJsonObjectAfterMarker(html: string, marker: string): string | null {
+  const idx = html.indexOf(marker);
+  if (idx < 0) return null;
+
+  const startBrace = html.indexOf("{", idx);
+  if (startBrace < 0) return null;
+
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+
+  for (let i = startBrace; i < html.length; i++) {
+    const ch = html[i];
+
+    if (inStr) {
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === "\\") {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inStr = true;
+      continue;
+    }
+
+    if (ch === "{") depth++;
+    if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return html.slice(startBrace, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractQuotedValue(html: string, key: string): string | null {
+  const re = new RegExp(`"${key}":"([^"]+)"`);
+  const m = html.match(re);
+  return m?.[1] ?? null;
+}
+
+async function fetchWatchHtml(videoId: string): Promise<string> {
+  const urls = [
+    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US&bpctr=9999999999&has_verified=1`,
+    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US`,
+    `https://www.youtube.com/watch?v=${videoId}`,
+  ];
+
+  let lastStatus = 0;
+  for (const url of urls) {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        // Often required to avoid getting a cookie-consent interstitial instead of the real watch page
+        Cookie: "CONSENT=YES+1; SOCS=CAI",
+      },
+    });
+
+    lastStatus = res.status;
+    const html = await res.text();
+
+    // A usable page should contain at least one of these.
+    if (res.ok && (html.includes("ytInitialPlayerResponse") || html.includes("INNERTUBE_API_KEY"))) {
+      return html;
+    }
+
+    // Sometimes the page still loads but without those fields; try next URL.
+  }
+
+  throw new Error(`Failed to fetch usable watch page (last status ${lastStatus})`);
+}
+
+async function fetchPlayerViaInnertube(args: {
+  videoId: string;
+  apiKey: string;
+  clientVersion: string;
+  context?: unknown;
+}): Promise<any> {
+  const { videoId, apiKey, clientVersion, context } = args;
+
+  const body: any = {
+    videoId,
+    context: context ?? {
+      client: {
+        clientName: "WEB",
+        clientVersion,
+        hl: "en",
+        gl: "US",
+      },
+    },
+  };
+
+  const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": UA,
+      "Accept-Language": "en-US,en;q=0.9",
+      Origin: "https://www.youtube.com",
+      Referer: "https://www.youtube.com/",
+      "X-Youtube-Client-Name": "1",
+      "X-Youtube-Client-Version": clientVersion,
+      Cookie: "CONSENT=YES+1; SOCS=CAI",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    console.error("Innertube player error:", res.status, t.slice(0, 500));
+    throw new Error(`Innertube player request failed (${res.status})`);
+  }
+
+  return await res.json();
+}
+
+async function fetchTranscriptFromPage(videoId: string): Promise<{
+  transcript: string;
+  segments: TranscriptSegment[];
   title: string;
   duration: string;
 }> {
-  console.log("Fetching video page for:", videoId);
-  
-  const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: { 
-      "User-Agent": UA,
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
+  console.log("Fetching watch page for:", videoId);
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch video page: ${response.status}`);
-  }
+  const html = await fetchWatchHtml(videoId);
 
-  const html = await response.text();
-  
   // Extract title
   const titleMatch = html.match(/<title>([^<]+)<\/title>/);
   const title = titleMatch ? titleMatch[1].replace(" - YouTube", "").trim() : "YouTube Video";
-  
+
   // Extract duration
   const durationMatch = html.match(/"lengthSeconds":"(\d+)"/);
   let duration = "Unknown";
@@ -102,48 +223,72 @@ async function fetchTranscriptFromPage(videoId: string): Promise<{
 
   console.log("Video info:", { title, duration });
 
-  // Find captions in ytInitialPlayerResponse
-  const playerResponseMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
-  if (!playerResponseMatch) {
-    console.log("No ytInitialPlayerResponse found");
-    throw new Error("Could not find player response");
+  let playerResponse: any | null = null;
+
+  // Parse ytInitialPlayerResponse from HTML (brace-balanced)
+  const playerJson = extractBalancedJsonObjectAfterMarker(html, "ytInitialPlayerResponse");
+  if (playerJson) {
+    try {
+      playerResponse = JSON.parse(playerJson);
+    } catch (e) {
+      console.error("Failed to parse ytInitialPlayerResponse JSON:", e);
+    }
   }
 
-  let playerResponse: any;
-  try {
-    playerResponse = JSON.parse(playerResponseMatch[1]);
-  } catch (e) {
-    console.log("Failed to parse player response");
-    throw new Error("Could not parse player response");
+  // If captions are not present in the embedded player response, fall back to Innertube
+  const embeddedTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks as any[] | undefined;
+
+  if (!embeddedTracks?.length) {
+    const apiKey = extractQuotedValue(html, "INNERTUBE_API_KEY");
+    const clientVersion = extractQuotedValue(html, "INNERTUBE_CLIENT_VERSION") ?? "2.20240101.00.00";
+
+    if (apiKey) {
+      console.log("Captions missing in HTML player response; trying Innertube...", { clientVersion });
+
+      let context: unknown = undefined;
+      const ctxJson = extractBalancedJsonObjectAfterMarker(html, "\"INNERTUBE_CONTEXT\"");
+      if (ctxJson) {
+        try {
+          context = JSON.parse(ctxJson);
+        } catch (e) {
+          console.error("Failed to parse INNERTUBE_CONTEXT:", e);
+        }
+      }
+
+      playerResponse = await fetchPlayerViaInnertube({ videoId, apiKey, clientVersion, context });
+    } else {
+      console.log("INNERTUBE_API_KEY not found; cannot try Innertube fallback");
+    }
   }
 
-  // Get captions from player response
-  const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  
-  if (!captionTracks || !captionTracks.length) {
-    console.log("No caption tracks found in player response");
+  const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks as any[] | undefined;
+
+  if (!captionTracks?.length) {
+    console.log("No caption tracks found. playabilityStatus:", playerResponse?.playabilityStatus?.status);
     throw new Error("No captions available for this video");
   }
 
   console.log("Found caption tracks:", captionTracks.length);
 
-  // Prefer English, fallback to first available
-  const englishTrack = captionTracks.find((t: any) => 
-    t.languageCode?.toLowerCase().startsWith("en")
-  );
+  // Prefer English, fallback to first available (include ASR auto-captions if that's all there is)
+  const englishTrack = captionTracks.find((t) => t.languageCode?.toLowerCase().startsWith("en"));
   const selectedTrack = englishTrack || captionTracks[0];
-  
+
   if (!selectedTrack?.baseUrl) {
     throw new Error("No valid caption track URL found");
   }
 
-  console.log("Selected caption track:", { lang: selectedTrack.languageCode, name: selectedTrack.name?.simpleText });
+  console.log("Selected caption track:", {
+    lang: selectedTrack.languageCode,
+    kind: selectedTrack.kind,
+    name: selectedTrack.name?.simpleText,
+  });
 
-  // Fetch the actual transcript
   const transcriptResponse = await fetch(selectedTrack.baseUrl, {
-    headers: { 
+    headers: {
       "User-Agent": UA,
       "Accept-Language": "en-US,en;q=0.9",
+      Cookie: "CONSENT=YES+1; SOCS=CAI",
     },
   });
 
@@ -152,51 +297,36 @@ async function fetchTranscriptFromPage(videoId: string): Promise<{
   }
 
   const transcriptXml = await transcriptResponse.text();
-  
-  // Parse XML transcript
+
   const segments: TranscriptSegment[] = [];
   let fullTranscript = "";
 
-  const textRe = /<text\s+start="([^"]+)"\s+dur="([^"]+)"[^>]*>([^<]*)<\/text>/g;
+  // Common XML format
+  const textRe = /<text\s+start="([^"]+)"\s+dur="([^"]+)"[^>]*>([\s\S]*?)<\/text>/g;
   let match: RegExpExecArray | null;
-  
+
   while ((match = textRe.exec(transcriptXml))) {
     const start = parseFloat(match[1]);
     const dur = parseFloat(match[2]);
-    const text = decodeXmlEntities(match[3]);
-    
+    const text = decodeXmlEntities(match[3] ?? "");
+
     if (text) {
       segments.push({ text, start, duration: dur });
       fullTranscript += text + " ";
     }
   }
 
-  // Try alternative regex pattern if first one fails
-  if (segments.length === 0) {
-    const altTextRe = /<text[^>]*start="([^"]+)"[^>]*dur="([^"]+)"[^>]*>([\s\S]*?)<\/text>/g;
-    while ((match = altTextRe.exec(transcriptXml))) {
-      const start = parseFloat(match[1]);
-      const dur = parseFloat(match[2]);
-      const text = decodeXmlEntities(match[3]);
-      
-      if (text) {
-        segments.push({ text, start, duration: dur });
-        fullTranscript += text + " ";
-      }
-    }
-  }
-
   console.log("Transcript parsed:", { segments: segments.length, chars: fullTranscript.length });
 
-  if (segments.length === 0) {
+  if (!segments.length) {
     throw new Error("Could not parse transcript segments");
   }
 
-  return { 
-    transcript: fullTranscript.trim(), 
-    segments, 
-    title, 
-    duration 
+  return {
+    transcript: fullTranscript.trim(),
+    segments,
+    title,
+    duration,
   };
 }
 
