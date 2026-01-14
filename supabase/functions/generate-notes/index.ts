@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.90.1?target=deno";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,6 +13,37 @@ interface TranscriptSegment {
   text: string;
   start: number;
   duration: number;
+}
+
+type TranscriptResult = {
+  transcript: string;
+  segments: TranscriptSegment[];
+  lang?: string;
+  source: "cache" | "timedtext" | "timedtext_list" | "watch" | "innertube" | "override";
+  usedCache: boolean;
+};
+
+type ErrorResponse = {
+  success: false;
+  error: string;
+  errorCode?: string;
+  debug?: Record<string, unknown>;
+};
+
+type SuccessResponse = {
+  success: true;
+  notes: {
+    title: string;
+    summary: string;
+    keyPoints: string[];
+    sections: Array<{ title: string; timestamp: string; content: string }>;
+    duration: string;
+  };
+  debug?: Record<string, unknown>;
+};
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatTimestamp(seconds: number): string {
@@ -34,12 +66,24 @@ function decodeXmlEntities(input: string): string {
     .replace(/&gt;/g, ">")
     .replace(/\n/g, " ");
 
+  // Numeric entities
   s = s.replace(/&#(\d+);/g, (_, num) => {
     const code = Number(num);
     return Number.isFinite(code) ? String.fromCharCode(code) : "";
   });
 
+  // Trim + collapse whitespace
   return s.replace(/\s+/g, " ").trim();
+}
+
+function parseAttributes(attrString: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /(\w+)="([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrString))) {
+    attrs[m[1]] = m[2];
+  }
+  return attrs;
 }
 
 function parseStartSecondsFromUrl(videoUrl: string): number {
@@ -48,6 +92,7 @@ function parseStartSecondsFromUrl(videoUrl: string): number {
     const t = u.searchParams.get("t") || u.searchParams.get("start");
     if (!t) return 0;
 
+    // supports: 1706, 1706s, 1h2m3s
     if (/^\d+$/.test(t)) return Number(t);
     if (/^\d+s$/.test(t)) return Number(t.slice(0, -1));
 
@@ -61,11 +106,304 @@ function parseStartSecondsFromUrl(videoUrl: string): number {
   }
 }
 
-// Fetch transcript from YouTube.
-// Strategy:
-// 1) Fetch the watch page HTML (with consent-bypass hints) and parse ytInitialPlayerResponse.
-// 2) If captions are missing, fall back to YouTube's internal "youtubei/v1/player" (Innertube) using keys embedded in the HTML.
+function buildTimestampedTranscript(segments: TranscriptSegment[], groupSize = 12): string {
+  const blocks: string[] = [];
+  for (let i = 0; i < segments.length; i += groupSize) {
+    const group = segments.slice(i, i + groupSize);
+    if (!group.length) continue;
+    const start = group[0].start;
+    const text = group.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    blocks.push(`[${formatTimestamp(start)}] ${text}`);
+  }
+  return blocks.join("\n");
+}
 
+function splitIntoChunks(text: string, maxChars: number, maxChunks: number): string[] {
+  const chunks: string[] = [];
+  let i = 0;
+  while (i < text.length && chunks.length < maxChunks) {
+    const slice = text.slice(i, i + maxChars);
+    chunks.push(slice);
+    i += maxChars;
+  }
+  return chunks;
+}
+
+function extractJsonFromText(input: string): string | null {
+  const fenced = input.match(/```json\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) return fenced[1].trim();
+
+  const firstBrace = input.indexOf("{");
+  const lastBrace = input.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) return input.slice(firstBrace, lastBrace + 1);
+
+  return null;
+}
+
+function parseJsonLenient<T>(input: string): T {
+  const raw = extractJsonFromText(input) ?? input;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    // Remove trailing commas
+    const cleaned = raw.replace(/,\s*([}\]])/g, "$1");
+    return JSON.parse(cleaned) as T;
+  }
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  opts?: { retries?: number; baseDelayMs?: number; retryOn?: number[] },
+): Promise<Response> {
+  const retries = opts?.retries ?? 3;
+  const baseDelayMs = opts?.baseDelayMs ?? 600;
+  const retryOn = opts?.retryOn ?? [429, 500, 502, 503, 504];
+
+  let last: Response | null = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, init);
+    last = res;
+
+    if (!retryOn.includes(res.status)) return res;
+
+    const delay = baseDelayMs * Math.pow(2, attempt);
+    console.log(`Retrying ${url} after status ${res.status} (attempt ${attempt + 1}/${retries + 1}) delay=${delay}ms`);
+    await sleep(delay);
+  }
+
+  return last!;
+}
+
+async function getVideoTitleViaOEmbed(videoId: string): Promise<string> {
+  try {
+    const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}&format=json`;
+    const res = await fetchWithRetry(url, {
+      headers: {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    }, { retries: 2, baseDelayMs: 500 });
+
+    if (!res.ok) return "YouTube Video";
+    const data = await res.json().catch(() => null);
+    return (data?.title as string) || "YouTube Video";
+  } catch {
+    return "YouTube Video";
+  }
+}
+
+function computeDurationFromSegments(segments: TranscriptSegment[]): string {
+  if (!segments.length) return "Unknown";
+  let maxEnd = 0;
+  for (const s of segments) {
+    const end = (s.start || 0) + (s.duration || 0);
+    if (end > maxEnd) maxEnd = end;
+  }
+  if (!Number.isFinite(maxEnd) || maxEnd <= 0) return "Unknown";
+  return formatTimestamp(maxEnd);
+}
+
+function getSupabaseAdmin() {
+  const url = Deno.env.get("SUPABASE_URL");
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !key) return null;
+
+  return createClient(url, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { "X-Client-Info": "vidbrief-generate-notes" } },
+  });
+}
+
+async function getCachedTranscript(videoId: string): Promise<TranscriptResult | null> {
+  const supabaseAdmin = getSupabaseAdmin();
+  if (!supabaseAdmin) return null;
+
+  const { data, error } = await supabaseAdmin
+    .from("video_transcripts_cache")
+    .select("transcript, segments, lang, source, updated_at")
+    .eq("video_id", videoId)
+    .maybeSingle();
+
+  if (error || !data?.transcript) return null;
+
+  const segments = Array.isArray(data.segments) ? data.segments : [];
+
+  return {
+    transcript: data.transcript,
+    segments,
+    lang: data.lang ?? undefined,
+    source: "cache",
+    usedCache: true,
+  };
+}
+
+async function saveCachedTranscript(args: {
+  videoId: string;
+  transcript: string;
+  segments: TranscriptSegment[];
+  lang?: string;
+  source: string;
+}) {
+  const supabaseAdmin = getSupabaseAdmin();
+  if (!supabaseAdmin) return;
+
+  await supabaseAdmin
+    .from("video_transcripts_cache")
+    .upsert({
+      video_id: args.videoId,
+      transcript: args.transcript,
+      segments: args.segments,
+      lang: args.lang ?? null,
+      source: args.source,
+    }, { onConflict: "video_id" });
+}
+
+function parseTimedTextXml(xml: string): { transcript: string; segments: TranscriptSegment[] } {
+  const segments: TranscriptSegment[] = [];
+  let full = "";
+
+  const textRe = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
+  let m: RegExpExecArray | null;
+  while ((m = textRe.exec(xml))) {
+    const attrs = parseAttributes(m[1]);
+    const start = Number(attrs.start || 0);
+    const dur = Number(attrs.dur || 0);
+    const text = decodeXmlEntities(m[2] || "");
+    if (!text) continue;
+    segments.push({ text, start, duration: dur });
+    full += text + " ";
+  }
+
+  return { transcript: full.trim(), segments };
+}
+
+async function tryTimedTextDirect(videoId: string): Promise<TranscriptResult | null> {
+  const bases = ["https://www.youtube.com/api/timedtext", "https://video.google.com/timedtext"];
+
+  const attempts: Array<{ lang: string; kind?: string; fmt?: string; label: string }> = [
+    { lang: "en", fmt: "srv3", label: "en_srv3" },
+    { lang: "en", kind: "asr", fmt: "srv3", label: "en_asr_srv3" },
+    { lang: "en", label: "en" },
+    { lang: "en", kind: "asr", label: "en_asr" },
+  ];
+
+  for (const base of bases) {
+    for (const a of attempts) {
+      const url = new URL(base);
+      url.searchParams.set("v", videoId);
+      url.searchParams.set("lang", a.lang);
+      if (a.kind) url.searchParams.set("kind", a.kind);
+      if (a.fmt) url.searchParams.set("fmt", a.fmt);
+
+      const res = await fetchWithRetry(url.toString(), {
+        headers: {
+          "User-Agent": UA,
+          "Accept-Language": "en-US,en;q=0.9",
+          Cookie: "CONSENT=YES+1; SOCS=CAI",
+        },
+      }, { retries: 2, baseDelayMs: 700 });
+
+      const text = await res.text();
+      if (!res.ok || text.length < 20) continue;
+
+      const parsed = parseTimedTextXml(text);
+      if (parsed.segments.length > 10 && parsed.transcript.length > 200) {
+        console.log("Timedtext direct transcript ok:", { base, attempt: a.label, segments: parsed.segments.length });
+        return {
+          transcript: parsed.transcript,
+          segments: parsed.segments,
+          lang: a.lang,
+          source: "timedtext",
+          usedCache: false,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function listCaptionTracks(videoId: string): Promise<Array<{ lang: string; name?: string; kind?: string }>> {
+  const listUrls = [
+    `https://www.youtube.com/api/timedtext?type=list&v=${videoId}`,
+    `https://video.google.com/timedtext?type=list&v=${videoId}`,
+  ];
+
+  for (const url of listUrls) {
+    const res = await fetchWithRetry(url, {
+      headers: {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        Cookie: "CONSENT=YES+1; SOCS=CAI",
+      },
+    }, { retries: 2, baseDelayMs: 700 });
+
+    const xml = await res.text();
+    if (!res.ok || xml.length < 20) continue;
+
+    const tracks: Array<{ lang: string; name?: string; kind?: string }> = [];
+    const trackRe = /<track\b([^/>]*)\/>/g;
+    let m: RegExpExecArray | null;
+    while ((m = trackRe.exec(xml))) {
+      const attrs = parseAttributes(m[1]);
+      const lang = attrs.lang_code || attrs.lang || "";
+      if (!lang) continue;
+      const name = attrs.name ? decodeXmlEntities(attrs.name) : undefined;
+      const kind = attrs.kind || undefined;
+      tracks.push({ lang, name, kind });
+    }
+
+    if (tracks.length) return tracks;
+  }
+
+  return [];
+}
+
+async function tryTimedTextFromList(videoId: string): Promise<TranscriptResult | null> {
+  const tracks = await listCaptionTracks(videoId);
+  if (!tracks.length) return null;
+
+  // Prefer English, otherwise first
+  const preferred = tracks.find((t) => t.lang.toLowerCase().startsWith("en")) || tracks[0];
+
+  const bases = ["https://www.youtube.com/api/timedtext", "https://video.google.com/timedtext"];
+
+  for (const base of bases) {
+    const url = new URL(base);
+    url.searchParams.set("v", videoId);
+    url.searchParams.set("lang", preferred.lang);
+    if (preferred.name) url.searchParams.set("name", preferred.name);
+
+    const res = await fetchWithRetry(url.toString(), {
+      headers: {
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        Cookie: "CONSENT=YES+1; SOCS=CAI",
+      },
+    }, { retries: 2, baseDelayMs: 700 });
+
+    const xml = await res.text();
+    if (!res.ok || xml.length < 20) continue;
+
+    const parsed = parseTimedTextXml(xml);
+    if (parsed.segments.length > 10 && parsed.transcript.length > 200) {
+      console.log("Timedtext list transcript ok:", { base, lang: preferred.lang, segments: parsed.segments.length });
+      return {
+        transcript: parsed.transcript,
+        segments: parsed.segments,
+        lang: preferred.lang,
+        source: "timedtext_list",
+        usedCache: false,
+      };
+    }
+  }
+
+  return null;
+}
+
+// Legacy fallback: watch page parsing + Innertube
 function extractBalancedJsonObjectAfterMarker(html: string, marker: string): string | null {
   const idx = html.indexOf(marker);
   if (idx < 0) return null;
@@ -127,24 +465,20 @@ async function fetchWatchHtml(videoId: string): Promise<string> {
 
   let lastStatus = 0;
   for (const url of urls) {
-    const res = await fetch(url, {
+    const res = await fetchWithRetry(url, {
       headers: {
         "User-Agent": UA,
         "Accept-Language": "en-US,en;q=0.9",
-        // Often required to avoid getting a cookie-consent interstitial instead of the real watch page
         Cookie: "CONSENT=YES+1; SOCS=CAI",
       },
-    });
+    }, { retries: 2, baseDelayMs: 900, retryOn: [429, 503] });
 
     lastStatus = res.status;
     const html = await res.text();
 
-    // A usable page should contain at least one of these.
     if (res.ok && (html.includes("ytInitialPlayerResponse") || html.includes("INNERTUBE_API_KEY"))) {
       return html;
     }
-
-    // Sometimes the page still loads but without those fields; try next URL.
   }
 
   throw new Error(`Failed to fetch usable watch page (last status ${lastStatus})`);
@@ -170,7 +504,7 @@ async function fetchPlayerViaInnertube(args: {
     },
   };
 
-  const res = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
+  const res = await fetchWithRetry(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -183,7 +517,7 @@ async function fetchPlayerViaInnertube(args: {
       Cookie: "CONSENT=YES+1; SOCS=CAI",
     },
     body: JSON.stringify(body),
-  });
+  }, { retries: 2, baseDelayMs: 900, retryOn: [429, 503] });
 
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -194,38 +528,11 @@ async function fetchPlayerViaInnertube(args: {
   return await res.json();
 }
 
-async function fetchTranscriptFromPage(videoId: string): Promise<{
-  transcript: string;
-  segments: TranscriptSegment[];
-  title: string;
-  duration: string;
-}> {
-  console.log("Fetching watch page for:", videoId);
-
+async function tryTranscriptFromWatchOrInnertube(videoId: string): Promise<TranscriptResult | null> {
   const html = await fetchWatchHtml(videoId);
-
-  // Extract title
-  const titleMatch = html.match(/<title>([^<]+)<\/title>/);
-  const title = titleMatch ? titleMatch[1].replace(" - YouTube", "").trim() : "YouTube Video";
-
-  // Extract duration
-  const durationMatch = html.match(/"lengthSeconds":"(\d+)"/);
-  let duration = "Unknown";
-  if (durationMatch) {
-    const seconds = parseInt(durationMatch[1]);
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    duration = hours > 0
-      ? `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`
-      : `${minutes}:${secs.toString().padStart(2, "0")}`;
-  }
-
-  console.log("Video info:", { title, duration });
 
   let playerResponse: any | null = null;
 
-  // Parse ytInitialPlayerResponse from HTML (brace-balanced)
   const playerJson = extractBalancedJsonObjectAfterMarker(html, "ytInitialPlayerResponse");
   if (playerJson) {
     try {
@@ -235,7 +542,6 @@ async function fetchTranscriptFromPage(videoId: string): Promise<{
     }
   }
 
-  // If captions are not present in the embedded player response, fall back to Innertube
   const embeddedTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks as any[] | undefined;
 
   if (!embeddedTracks?.length) {
@@ -243,8 +549,6 @@ async function fetchTranscriptFromPage(videoId: string): Promise<{
     const clientVersion = extractQuotedValue(html, "INNERTUBE_CLIENT_VERSION") ?? "2.20240101.00.00";
 
     if (apiKey) {
-      console.log("Captions missing in HTML player response; trying Innertube...", { clientVersion });
-
       let context: unknown = undefined;
       const ctxJson = extractBalancedJsonObjectAfterMarker(html, "\"INNERTUBE_CONTEXT\"");
       if (ctxJson) {
@@ -255,152 +559,204 @@ async function fetchTranscriptFromPage(videoId: string): Promise<{
         }
       }
 
+      console.log("Watch page missing tracks; trying Innertube...", { clientVersion });
       playerResponse = await fetchPlayerViaInnertube({ videoId, apiKey, clientVersion, context });
-    } else {
-      console.log("INNERTUBE_API_KEY not found; cannot try Innertube fallback");
     }
   }
 
   const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks as any[] | undefined;
+  if (!captionTracks?.length) return null;
 
-  if (!captionTracks?.length) {
-    console.log("No caption tracks found. playabilityStatus:", playerResponse?.playabilityStatus?.status);
-    throw new Error("No captions available for this video");
-  }
-
-  console.log("Found caption tracks:", captionTracks.length);
-
-  // Prefer English, fallback to first available (include ASR auto-captions if that's all there is)
   const englishTrack = captionTracks.find((t) => t.languageCode?.toLowerCase().startsWith("en"));
   const selectedTrack = englishTrack || captionTracks[0];
+  if (!selectedTrack?.baseUrl) return null;
 
-  if (!selectedTrack?.baseUrl) {
-    throw new Error("No valid caption track URL found");
-  }
-
-  console.log("Selected caption track:", {
-    lang: selectedTrack.languageCode,
-    kind: selectedTrack.kind,
-    name: selectedTrack.name?.simpleText,
-  });
-
-  const transcriptResponse = await fetch(selectedTrack.baseUrl, {
+  const transcriptResponse = await fetchWithRetry(selectedTrack.baseUrl, {
     headers: {
       "User-Agent": UA,
       "Accept-Language": "en-US,en;q=0.9",
       Cookie: "CONSENT=YES+1; SOCS=CAI",
     },
-  });
+  }, { retries: 2, baseDelayMs: 900, retryOn: [429, 503] });
 
-  if (!transcriptResponse.ok) {
-    throw new Error(`Failed to fetch transcript: ${transcriptResponse.status}`);
+  if (!transcriptResponse.ok) return null;
+  const xml = await transcriptResponse.text();
+  if (xml.length < 20) return null;
+
+  const parsed = parseTimedTextXml(xml);
+  if (parsed.segments.length > 10 && parsed.transcript.length > 200) {
+    return {
+      transcript: parsed.transcript,
+      segments: parsed.segments,
+      lang: selectedTrack.languageCode,
+      source: captionTracks === embeddedTracks ? "watch" : "innertube",
+      usedCache: false,
+    };
   }
-
-  const transcriptXml = await transcriptResponse.text();
-
-  const segments: TranscriptSegment[] = [];
-  let fullTranscript = "";
-
-  // Common XML format
-  const textRe = /<text\s+start="([^"]+)"\s+dur="([^"]+)"[^>]*>([\s\S]*?)<\/text>/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = textRe.exec(transcriptXml))) {
-    const start = parseFloat(match[1]);
-    const dur = parseFloat(match[2]);
-    const text = decodeXmlEntities(match[3] ?? "");
-
-    if (text) {
-      segments.push({ text, start, duration: dur });
-      fullTranscript += text + " ";
-    }
-  }
-
-  console.log("Transcript parsed:", { segments: segments.length, chars: fullTranscript.length });
-
-  if (!segments.length) {
-    throw new Error("Could not parse transcript segments");
-  }
-
-  return {
-    transcript: fullTranscript.trim(),
-    segments,
-    title,
-    duration,
-  };
-}
-
-function buildTimestampedTranscript(segments: TranscriptSegment[], groupSize = 12): string {
-  const blocks: string[] = [];
-  for (let i = 0; i < segments.length; i += groupSize) {
-    const group = segments.slice(i, i + groupSize);
-    if (!group.length) continue;
-    const start = group[0].start;
-    const text = group.map((s) => s.text).join(" ").replace(/\s+/g, " ").trim();
-    if (!text) continue;
-    blocks.push(`[${formatTimestamp(start)}] ${text}`);
-  }
-  return blocks.join("\n");
-}
-
-function splitIntoChunks(text: string, maxChars: number, maxChunks: number): string[] {
-  const chunks: string[] = [];
-  let i = 0;
-  while (i < text.length && chunks.length < maxChunks) {
-    const slice = text.slice(i, i + maxChars);
-    chunks.push(slice);
-    i += maxChars;
-  }
-  return chunks;
-}
-
-function extractJsonFromText(input: string): string | null {
-  const fenced = input.match(/```json\s*([\s\S]*?)\s*```/i);
-  if (fenced?.[1]) return fenced[1].trim();
-
-  const firstBrace = input.indexOf("{");
-  const lastBrace = input.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) return input.slice(firstBrace, lastBrace + 1);
 
   return null;
 }
 
-function parseJsonLenient<T>(input: string): T {
-  const raw = extractJsonFromText(input) ?? input;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    const cleaned = raw.replace(/,\s*([}\]])/g, "$1");
-    return JSON.parse(cleaned) as T;
+async function fetchTranscriptBestEffort(args: {
+  videoId: string;
+  transcriptOverride?: string;
+}): Promise<{ result: TranscriptResult | null; debug: Record<string, unknown> }> {
+  const { videoId, transcriptOverride } = args;
+
+  const debug: Record<string, unknown> = { videoId };
+
+  if (transcriptOverride && transcriptOverride.trim().length >= 200) {
+    const cleaned = transcriptOverride.replace(/\s+/g, " ").trim();
+    return {
+      result: {
+        transcript: cleaned,
+        segments: [],
+        source: "override",
+        usedCache: false,
+      },
+      debug: { ...debug, mode: "override", transcriptChars: cleaned.length },
+    };
   }
+
+  const cached = await getCachedTranscript(videoId);
+  if (cached) {
+    return {
+      result: cached,
+      debug: {
+        ...debug,
+        mode: "cache",
+        transcriptChars: cached.transcript.length,
+        segments: cached.segments.length,
+      },
+    };
+  }
+
+  const timedtextDirect = await tryTimedTextDirect(videoId);
+  if (timedtextDirect) {
+    await saveCachedTranscript({
+      videoId,
+      transcript: timedtextDirect.transcript,
+      segments: timedtextDirect.segments,
+      lang: timedtextDirect.lang,
+      source: timedtextDirect.source,
+    });
+
+    return {
+      result: timedtextDirect,
+      debug: {
+        ...debug,
+        mode: timedtextDirect.source,
+        transcriptChars: timedtextDirect.transcript.length,
+        segments: timedtextDirect.segments.length,
+      },
+    };
+  }
+
+  const timedtextList = await tryTimedTextFromList(videoId);
+  if (timedtextList) {
+    await saveCachedTranscript({
+      videoId,
+      transcript: timedtextList.transcript,
+      segments: timedtextList.segments,
+      lang: timedtextList.lang,
+      source: timedtextList.source,
+    });
+
+    return {
+      result: timedtextList,
+      debug: {
+        ...debug,
+        mode: timedtextList.source,
+        transcriptChars: timedtextList.transcript.length,
+        segments: timedtextList.segments.length,
+      },
+    };
+  }
+
+  // Last resort fallback (can be rate-limited by YouTube)
+  try {
+    const legacy = await tryTranscriptFromWatchOrInnertube(videoId);
+    if (legacy) {
+      await saveCachedTranscript({
+        videoId,
+        transcript: legacy.transcript,
+        segments: legacy.segments,
+        lang: legacy.lang,
+        source: legacy.source,
+      });
+
+      return {
+        result: legacy,
+        debug: {
+          ...debug,
+          mode: legacy.source,
+          transcriptChars: legacy.transcript.length,
+          segments: legacy.segments.length,
+        },
+      };
+    }
+  } catch (e) {
+    debug.watchFallbackError = e instanceof Error ? e.message : String(e);
+  }
+
+  return { result: null, debug: { ...debug, mode: "none" } };
 }
 
-async function callAiJson<T>(args: {
+async function callAiNotes(args: {
   lovableApiKey: string;
-  model: string;
   system: string;
   user: string;
-  schemaName: string;
-  schema: Record<string, unknown>;
   maxCompletionTokens: number;
-}): Promise<T> {
-  const { lovableApiKey, model, system, user, schemaName, schema, maxCompletionTokens } = args;
+}): Promise<{
+  title: string;
+  summary: string;
+  keyPoints: string[];
+  sections: Array<{ title: string; timestamp: string; content: string }>;
+}> {
+  const { lovableApiKey, system, user, maxCompletionTokens } = args;
 
-  const body = {
-    model,
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["title", "summary", "keyPoints", "sections"],
+    properties: {
+      title: { type: "string" },
+      summary: { type: "string" },
+      keyPoints: { type: "array", items: { type: "string" } },
+      sections: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "timestamp", "content"],
+          properties: {
+            title: { type: "string" },
+            timestamp: { type: "string" },
+            content: { type: "string" },
+          },
+        },
+      },
+    },
+  } as const;
+
+  const body: any = {
+    model: "google/gemini-3-flash-preview",
     messages: [
       { role: "system", content: system },
       { role: "user", content: user },
     ],
     max_completion_tokens: maxCompletionTokens,
-    response_format: {
-      type: "json_schema",
-      json_schema: {
-        name: schemaName,
-        schema,
-        strict: true,
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "create_notes",
+          description: "Create structured notes from a transcript.",
+          parameters: schema,
+        },
       },
-    },
+    ],
+    tool_choice: { type: "function", function: { name: "create_notes" } },
   };
 
   const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
@@ -416,21 +772,98 @@ async function callAiJson<T>(args: {
     const errorText = await res.text().catch(() => "");
     console.error("AI gateway error:", res.status, errorText);
 
-    if (res.status === 429) throw new Error("Rate limit exceeded. Please try again in a moment.");
-    if (res.status === 402) throw new Error("Usage limit reached. Please add credits to continue.");
+    if (res.status === 429) throw Object.assign(new Error("Rate limit exceeded. Please try again in a moment."), { code: "RATE_LIMIT" });
+    if (res.status === 402) throw Object.assign(new Error("Usage limit reached. Please add credits to continue."), { code: "PAYMENT_REQUIRED" });
 
     throw new Error("Failed to generate notes. Please try again.");
   }
 
   const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
+  const msg = data?.choices?.[0]?.message;
 
-  if (typeof content !== "string" || !content.trim()) {
-    console.error("Empty AI response:", JSON.stringify(data).slice(0, 800));
-    throw new Error("AI returned an empty response.");
+  // Tool-call path
+  const toolArgs = msg?.tool_calls?.[0]?.function?.arguments;
+  if (typeof toolArgs === "string" && toolArgs.trim()) {
+    return parseJsonLenient(toolArgs);
   }
 
-  return parseJsonLenient<T>(content);
+  // Fallback: parse content if tool calls were not returned
+  const content = msg?.content;
+  if (typeof content === "string" && content.trim()) {
+    return parseJsonLenient(content);
+  }
+
+  console.error("Empty AI response:", JSON.stringify(data).slice(0, 800));
+  throw new Error("AI returned an empty response.");
+}
+
+async function callAiChunkSummary(args: {
+  lovableApiKey: string;
+  chunk: string;
+  maxCompletionTokens: number;
+}): Promise<{ chunkSummary: string; chunkKeyPoints: string[] }> {
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    required: ["chunkSummary", "chunkKeyPoints"],
+    properties: {
+      chunkSummary: { type: "string" },
+      chunkKeyPoints: { type: "array", items: { type: "string" } },
+    },
+  } as const;
+
+  const body: any = {
+    model: "google/gemini-2.5-flash-lite",
+    messages: [
+      {
+        role: "system",
+        content:
+          "Summarize this transcript chunk faithfully. Only use what is present. Keep it dense and factual. Do not add anything not in the chunk.",
+      },
+      { role: "user", content: args.chunk },
+    ],
+    max_completion_tokens: args.maxCompletionTokens,
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "chunk_notes",
+          description: "Return a dense summary and key points for a transcript chunk.",
+          parameters: schema,
+        },
+      },
+    ],
+    tool_choice: { type: "function", function: { name: "chunk_notes" } },
+  };
+
+  const res = await fetch("https://ai.gateway.lovable.dev/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${args.lovableApiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => "");
+    console.error("AI gateway error (chunk):", res.status, errorText);
+
+    if (res.status === 429) throw Object.assign(new Error("Rate limit exceeded. Please try again in a moment."), { code: "RATE_LIMIT" });
+    if (res.status === 402) throw Object.assign(new Error("Usage limit reached. Please add credits to continue."), { code: "PAYMENT_REQUIRED" });
+
+    throw new Error("Failed to summarize transcript. Please try again.");
+  }
+
+  const data = await res.json();
+  const msg = data?.choices?.[0]?.message;
+  const toolArgs = msg?.tool_calls?.[0]?.function?.arguments;
+  if (typeof toolArgs === "string" && toolArgs.trim()) return parseJsonLenient(toolArgs);
+
+  const content = msg?.content;
+  if (typeof content === "string" && content.trim()) return parseJsonLenient(content);
+
+  throw new Error("AI returned an empty response.");
 }
 
 serve(async (req) => {
@@ -439,63 +872,69 @@ serve(async (req) => {
   }
 
   try {
-    const { videoUrl, videoType = "General" } = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const videoUrl = body?.videoUrl as string | undefined;
+    const videoType = (body?.videoType as string | undefined) || "General";
+    const transcriptOverride = body?.transcriptOverride as string | undefined;
 
     if (!videoUrl) {
-      return new Response(JSON.stringify({ error: "Video URL is required" }), {
-        status: 400,
+      const payload: ErrorResponse = { success: false, error: "Video URL is required", errorCode: "BAD_REQUEST" };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) {
-      console.error("LOVABLE_API_KEY not configured");
-      return new Response(JSON.stringify({ error: "AI service not configured" }), {
-        status: 500,
+      const payload: ErrorResponse = { success: false, error: "AI service not configured", errorCode: "AI_NOT_CONFIGURED" };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
-    // Extract video ID from URL
     const videoIdMatch = videoUrl.match(
       /(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
     );
     const videoId = videoIdMatch ? videoIdMatch[1] : null;
 
     if (!videoId) {
-      return new Response(JSON.stringify({ error: "Invalid YouTube URL" }), {
-        status: 400,
+      const payload: ErrorResponse = { success: false, error: "Invalid YouTube URL", errorCode: "INVALID_URL" };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     const startSeconds = parseStartSecondsFromUrl(videoUrl);
-    console.log("Processing video:", { videoId, videoType, startSeconds });
+    console.log("Processing video:", { videoId, videoType, startSeconds, hasOverride: !!transcriptOverride });
 
-    // Fetch transcript and video info in one go
-    let transcript = "";
-    let segments: TranscriptSegment[] = [];
-    let videoTitle = "YouTube Video";
-    let videoDuration = "Unknown";
+    const videoTitle = await getVideoTitleViaOEmbed(videoId);
 
-    try {
-      const result = await fetchTranscriptFromPage(videoId);
-      transcript = result.transcript;
-      segments = result.segments;
-      videoTitle = result.title;
-      videoDuration = result.duration;
-    } catch (e) {
-      console.error("Transcript fetch failed:", e);
-      return new Response(
-        JSON.stringify({
-          error: "Could not fetch captions/transcript for this video. Please try a video with captions enabled.",
-        }),
-        { status: 422, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
+    const { result: transcriptResult, debug: transcriptDebug } = await fetchTranscriptBestEffort({
+      videoId,
+      transcriptOverride,
+    });
+
+    if (!transcriptResult) {
+      const payload: ErrorResponse = {
+        success: false,
+        error:
+          "Could not fetch captions/transcript for this video (YouTube may be rate-limiting or captions are disabled). Paste a transcript to continue.",
+        errorCode: "NO_TRANSCRIPT",
+        debug: transcriptDebug,
+      };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    // Apply timestamp offset if URL includes t=...
+    let segments = transcriptResult.segments;
+    let transcript = transcriptResult.transcript;
+
+    // Apply timestamp offset if URL includes t=... (only if we have real timestamps)
     if (startSeconds > 0 && segments.length) {
       const filtered = segments.filter((s) => s.start >= startSeconds);
       if (filtered.length) {
@@ -504,15 +943,12 @@ serve(async (req) => {
       }
     }
 
-    const hasTranscript = transcript.trim().length > 200 && segments.length > 10;
-    if (!hasTranscript) {
-      return new Response(
-        JSON.stringify({
-          error: "Could not fetch captions/transcript for this video. Please try a video with captions enabled.",
-        }),
-        { status: 422, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
-    }
+    const hasTimestamps = segments.length > 10;
+    const duration = hasTimestamps ? computeDurationFromSegments(segments) : "Unknown";
+
+    const timestampedTranscript = hasTimestamps
+      ? buildTimestampedTranscript(segments, 12)
+      : transcript;
 
     const typePrompts: Record<string, string> = {
       "Academic Lecture":
@@ -529,72 +965,25 @@ serve(async (req) => {
         "You are a comprehensive note-taker. Produce well-organized notes strictly from the transcript.",
     };
 
-    const systemPrompt = `${typePrompts[videoType] || typePrompts.General}\n\nOUTPUT REQUIREMENTS:\n- Only use information present in the provided transcript.\n- If unsure, say so briefly in the section content.\n- Use clear headings and tight, information-dense language.\n- Include timestamps in each section based on the transcript (mm:ss or h:mm:ss).`;
+    const systemPrompt = `${typePrompts[videoType] || typePrompts.General}\n\nOUTPUT REQUIREMENTS:\n- Only use information present in the provided transcript.\n- Do NOT invent details. If something is not in the transcript, omit it.\n- If timestamps are not available in the input, set section.timestamp to an empty string ("").\n- Use clear headings and tight, information-dense language.`;
 
-    const timestampedTranscript = buildTimestampedTranscript(segments, 12);
-
-    const DIRECT_MAX_CHARS = 22000;
+    const DIRECT_MAX_CHARS = 24000;
     const CHUNK_CHARS = 18000;
     const MAX_CHUNKS = 6;
-
-    const finalSchema = {
-      type: "object",
-      additionalProperties: false,
-      required: ["title", "summary", "keyPoints", "sections"],
-      properties: {
-        title: { type: "string" },
-        summary: { type: "string" },
-        keyPoints: { type: "array", items: { type: "string" } },
-        sections: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: ["title", "timestamp", "content"],
-            properties: {
-              title: { type: "string" },
-              timestamp: { type: "string" },
-              content: { type: "string" },
-            },
-          },
-        },
-      },
-    } as const;
-
-    const chunkSchema = {
-      type: "object",
-      additionalProperties: false,
-      required: ["chunkSummary", "chunkKeyPoints"],
-      properties: {
-        chunkSummary: { type: "string" },
-        chunkKeyPoints: { type: "array", items: { type: "string" } },
-      },
-    } as const;
-
-    console.log("Transcript stats:", {
-      chars: timestampedTranscript.length,
-      segments: segments.length,
-    });
 
     let synthesisInput = "";
 
     if (timestampedTranscript.length <= DIRECT_MAX_CHARS) {
-      synthesisInput = `VIDEO: ${videoTitle}\nTYPE: ${videoType}\nDURATION: ${videoDuration}\nSTART_OFFSET: ${startSeconds ? formatTimestamp(startSeconds) : "0:00"}\n\nTRANSCRIPT (timestamped):\n${timestampedTranscript}`;
+      synthesisInput = `VIDEO: ${videoTitle}\nTYPE: ${videoType}\nDURATION: ${duration}\nSTART_OFFSET: ${startSeconds ? formatTimestamp(startSeconds) : "0:00"}\n\nTRANSCRIPT${hasTimestamps ? " (timestamped)" : ""}:\n${timestampedTranscript}`;
     } else {
       const chunks = splitIntoChunks(timestampedTranscript, CHUNK_CHARS, MAX_CHUNKS);
-      console.log("Transcript is long; summarizing chunks:", { chunks: chunks.length });
+      console.log("Transcript long; summarizing chunks:", { chunks: chunks.length });
 
       const chunkSummaries: Array<{ chunkSummary: string; chunkKeyPoints: string[] }> = [];
       for (let i = 0; i < chunks.length; i++) {
-        console.log(`Summarizing chunk ${i + 1}/${chunks.length}...`);
-        const chunkNotes = await callAiJson<{ chunkSummary: string; chunkKeyPoints: string[] }>({
+        const chunkNotes = await callAiChunkSummary({
           lovableApiKey: LOVABLE_API_KEY,
-          model: "openai/gpt-5-nano",
-          system:
-            "Summarize this transcript chunk faithfully. Only use what is present. Keep it dense and factual.",
-          user: `CHUNK ${i + 1}/${chunks.length} (timestamped transcript):\n${chunks[i]}`,
-          schemaName: "chunk_notes",
-          schema: chunkSchema as unknown as Record<string, unknown>,
+          chunk: `CHUNK ${i + 1}/${chunks.length}:\n${chunks[i]}`,
           maxCompletionTokens: 900,
         });
         chunkSummaries.push(chunkNotes);
@@ -607,56 +996,69 @@ serve(async (req) => {
         )
         .join("\n\n---\n\n");
 
-      synthesisInput = `VIDEO: ${videoTitle}\nTYPE: ${videoType}\nDURATION: ${videoDuration}\nSTART_OFFSET: ${startSeconds ? formatTimestamp(startSeconds) : "0:00"}\n\nYou will generate final notes from these chunk summaries (derived from the transcript).\n\nCHUNK SUMMARIES:\n${combined}`;
+      synthesisInput = `VIDEO: ${videoTitle}\nTYPE: ${videoType}\nDURATION: ${duration}\nSTART_OFFSET: ${startSeconds ? formatTimestamp(startSeconds) : "0:00"}\n\nYou will generate final notes ONLY from these chunk summaries (derived from the transcript).\n\nCHUNK SUMMARIES:\n${combined}`;
     }
 
-    console.log("Sending synthesis request to AI...");
-    const notes = await callAiJson<{
-      title: string;
-      summary: string;
-      keyPoints: string[];
-      sections: Array<{ title: string; timestamp: string; content: string }>;
-    }>({
+    console.log("Sending synthesis request to AI...", {
+      transcriptSource: transcriptResult.source,
+      usedCache: transcriptResult.usedCache,
+      hasTimestamps,
+      transcriptChars: transcript.length,
+      segments: segments.length,
+    });
+
+    const notes = await callAiNotes({
       lovableApiKey: LOVABLE_API_KEY,
-      model: "openai/gpt-5-mini",
       system: systemPrompt,
-      user: `${synthesisInput}\n\nCreate comprehensive notes. Ensure JSON matches the schema exactly.`,
-      schemaName: "video_notes",
-      schema: finalSchema as unknown as Record<string, unknown>,
+      user: `${synthesisInput}\n\nCreate comprehensive notes.`,
       maxCompletionTokens: 4000,
     });
 
     // Basic validation
-    if (
-      !notes.title ||
-      !notes.summary ||
-      !Array.isArray(notes.keyPoints) ||
-      !Array.isArray(notes.sections)
-    ) {
-      console.error("Invalid notes structure:", JSON.stringify(notes).slice(0, 500));
-      throw new Error("Generated notes have invalid structure");
+    if (!notes?.title || !notes?.summary || !Array.isArray(notes?.keyPoints) || !Array.isArray(notes?.sections)) {
+      console.error("Invalid notes structure:", JSON.stringify(notes).slice(0, 800));
+      const payload: ErrorResponse = { success: false, error: "Failed to parse notes. Please try again.", errorCode: "PARSE_ERROR" };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
     }
 
-    console.log("Notes generated successfully:", {
-      title: notes.title.slice(0, 50),
-      keyPoints: notes.keyPoints.length,
-      sections: notes.sections.length,
-    });
+    const payload: SuccessResponse = {
+      success: true,
+      notes: {
+        title: notes.title,
+        summary: notes.summary,
+        keyPoints: notes.keyPoints,
+        sections: notes.sections,
+        duration,
+      },
+      debug: {
+        ...transcriptDebug,
+        transcriptSource: transcriptResult.source,
+        usedCache: transcriptResult.usedCache,
+        transcriptChars: transcript.length,
+        segments: segments.length,
+        hasTimestamps,
+      },
+    };
 
-    return new Response(
-      JSON.stringify({
-        ...notes,
-        videoTitle: videoTitle,
-        videoUrl,
-        duration: videoDuration,
-      }),
-      { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-    );
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   } catch (error) {
-    console.error("Error:", error);
-    const message = error instanceof Error ? error.message : "An unexpected error occurred";
-    return new Response(JSON.stringify({ error: message }), {
-      status: 500,
+    console.error("Unhandled error:", error);
+    const code = (error as any)?.code as string | undefined;
+
+    const payload: ErrorResponse = {
+      success: false,
+      error: error instanceof Error ? error.message : "An unexpected error occurred",
+      errorCode: code,
+    };
+
+    return new Response(JSON.stringify(payload), {
+      status: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
