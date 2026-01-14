@@ -1,18 +1,24 @@
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Youtube, Sparkles, Loader2, Check, ChevronDown, GraduationCap, Heart, Wrench, BookOpen, MessageSquare, FileText } from "lucide-react";
+import { Youtube, Sparkles, Loader2, Check, ChevronDown, GraduationCap, Heart, Wrench, BookOpen, MessageSquare, FileText, ClipboardPaste } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { toast } from "sonner";
 
 interface YouTubeInputProps {
-  onGenerate: (url: string, videoType: string) => void;
+  onGenerate: (url: string, videoType: string, transcriptOverride?: string) => void;
   isLoading: boolean;
 }
 
@@ -29,6 +35,8 @@ export function YouTubeInput({ onGenerate, isLoading }: YouTubeInputProps) {
   const [url, setUrl] = useState("");
   const [videoType, setVideoType] = useState("General");
   const [isValid, setIsValid] = useState<boolean | null>(null);
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [transcriptOverride, setTranscriptOverride] = useState("");
 
   const validateYouTubeUrl = (url: string): boolean => {
     const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|embed\/|v\/)|youtu\.be\/)[\w-]+/;
@@ -57,7 +65,7 @@ export function YouTubeInput({ onGenerate, isLoading }: YouTubeInputProps) {
       return;
     }
 
-    onGenerate(url, videoType);
+    onGenerate(url, videoType, transcriptOverride.trim() || undefined);
   };
 
   const selectedType = videoTypes.find(t => t.value === videoType) || videoTypes[5];
@@ -92,7 +100,7 @@ export function YouTubeInput({ onGenerate, isLoading }: YouTubeInputProps) {
                   initial={{ scale: 0 }}
                   animate={{ scale: 1 }}
                   exit={{ scale: 0 }}
-                  className={`flex-shrink-0 ${isValid ? 'text-green-500' : 'text-destructive'}`}
+                  className={`flex-shrink-0 ${isValid ? 'text-success' : 'text-destructive'}`}
                 >
                   {isValid && <Check className="w-5 h-5" />}
                 </motion.div>
@@ -130,7 +138,7 @@ export function YouTubeInput({ onGenerate, isLoading }: YouTubeInputProps) {
               className="flex items-center gap-2 px-4"
             >
               {isValid ? (
-                <span className="text-sm text-green-500 flex items-center gap-1">
+                <span className="text-sm text-success flex items-center gap-1">
                   <Check className="w-4 h-4" />
                   Valid YouTube link
                 </span>
@@ -185,6 +193,40 @@ export function YouTubeInput({ onGenerate, isLoading }: YouTubeInputProps) {
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+
+        {/* Transcript Override (collapsible) */}
+        <Collapsible open={showTranscript} onOpenChange={setShowTranscript}>
+          <CollapsibleTrigger asChild>
+            <Button
+              variant="ghost"
+              type="button"
+              className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground text-sm h-9"
+              disabled={isLoading}
+            >
+              <ClipboardPaste className="w-4 h-4" />
+              {showTranscript ? "Hide transcript input" : "Paste transcript (optional)"}
+              <ChevronDown className={`w-4 h-4 ml-auto transition-transform ${showTranscript ? "rotate-180" : ""}`} />
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="pt-2"
+            >
+              <Textarea
+                placeholder="If YouTube captions aren't available, paste the video transcript here..."
+                value={transcriptOverride}
+                onChange={(e) => setTranscriptOverride(e.target.value)}
+                className="min-h-[120px] text-sm bg-card border-border resize-y"
+                disabled={isLoading}
+              />
+              <p className="text-xs text-muted-foreground mt-2">
+                Use this if the video doesn't have captions or if you want to use a custom transcript.
+              </p>
+            </motion.div>
+          </CollapsibleContent>
+        </Collapsible>
       </form>
       
       <p className="text-center text-xs sm:text-sm text-muted-foreground mt-4">

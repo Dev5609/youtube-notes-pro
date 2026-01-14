@@ -34,6 +34,7 @@ export function Header({ onOpenHistory, onOpenAuth }: HeaderProps) {
           <span className="font-display font-semibold text-lg sm:text-xl text-foreground">
             VidBrief
           </span>
+        </div>
 
         {/* Desktop Navigation */}
         <div className="hidden sm:flex items-center gap-3">

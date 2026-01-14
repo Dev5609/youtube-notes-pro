@@ -20,13 +20,13 @@ const Index = () => {
   const [isAuthOpen, setIsAuthOpen] = useState(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  const handleGenerate = async (url: string, videoType: string) => {
+  const handleGenerate = async (url: string, videoType: string, transcriptOverride?: string) => {
     setIsLoading(true);
     setNotes(null);
 
     try {
       const { data, error } = await supabase.functions.invoke("generate-notes", {
-        body: { videoUrl: url, videoType },
+        body: { videoUrl: url, videoType, transcriptOverride },
       });
 
       if (error) {
@@ -35,8 +35,26 @@ const Index = () => {
         return;
       }
 
-      if (!data?.success || !data?.notes) {
-        toast.error(data?.error || "Failed to generate notes");
+      // Handle structured response
+      if (!data?.success) {
+        const errorMsg = data?.error || "Failed to generate notes";
+        const errorCode = data?.errorCode;
+        
+        if (errorCode === "NO_TRANSCRIPT") {
+          toast.error("This video doesn't have captions. Try a video with captions enabled.", {
+            duration: 6000,
+          });
+        } else if (errorCode === "RATE_LIMIT") {
+          toast.error("Rate limit reached. Please wait a moment and try again.", {
+            duration: 5000,
+          });
+        } else if (errorCode === "PAYMENT_REQUIRED") {
+          toast.error("Usage limit reached. Please add credits to continue.", {
+            duration: 5000,
+          });
+        } else {
+          toast.error(errorMsg);
+        }
         return;
       }
 
