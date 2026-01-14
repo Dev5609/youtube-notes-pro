@@ -235,7 +235,7 @@ If you find SummarIQ useful:
 
 <div align="center">
 
-### [🚀 Try SummarIQ Now](https://your-app-url.lovable.app)
+### [🚀 Try SummarIQ Now](https://summariq.vercel.app)
 
 **No installation required • Free to use • Start in seconds**
 
