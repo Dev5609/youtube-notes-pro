@@ -7,13 +7,21 @@
     <meta name="description" content="Turn YouTube videos into clear, structured notes in seconds. Export to PDF and study smarter with SummarIQ." />
     <meta name="author" content="Devansh" />
     <meta name="keywords" content="SummarIQ, YouTube notes, AI notes, video notes, study notes, lecture notes" />
+    
+    <!-- PWA Meta Tags -->
+    <meta name="theme-color" content="#14b8a6" />
     <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="apple-touch-icon" href="/icon-192x192.png">
 
+    <!-- Open Graph -->
     <meta property="og:title" content="SummarIQ - AI YouTube Notes" />
     <meta property="og:description" content="Turn YouTube videos into clear, structured notes in seconds with SummarIQ." />
     <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://summariq.vercel.app" />
     <meta property="og:image" content="https://i.postimg.cc/BQS76x0V/Chat-GPT-Image-Jan-13-2026-02-26-21-PM.png" />
 
+    <!-- Twitter -->
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="SummarIQ - AI YouTube Notes" />
     <meta name="twitter:description" content="Turn YouTube videos into clear, structured notes in seconds with SummarIQ." />
@@ -23,5 +31,12 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js')
+          .then(() => console.log('Service Worker registered'))
+          .catch(err => console.log('Service Worker registration failed:', err));
+      }
+    </script>
   </body>
 </html>
