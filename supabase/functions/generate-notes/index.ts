@@ -212,7 +212,7 @@ function getSupabaseAdmin() {
 
   return createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false },
-    global: { headers: { "X-Client-Info": "vidbrief-generate-notes" } },
+    global: { headers: { "X-Client-Info": "SummarIQ-generate-notes" } },
   });
 }
 
