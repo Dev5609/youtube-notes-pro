@@ -77,6 +77,39 @@ export type Database = {
         }
         Relationships: []
       }
+      video_transcripts_cache: {
+        Row: {
+          created_at: string
+          id: string
+          lang: string | null
+          segments: Json | null
+          source: string
+          transcript: string
+          updated_at: string
+          video_id: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          lang?: string | null
+          segments?: Json | null
+          source?: string
+          transcript: string
+          updated_at?: string
+          video_id: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          lang?: string | null
+          segments?: Json | null
+          source?: string
+          transcript?: string
+          updated_at?: string
+          video_id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never

@@ -28,7 +28,7 @@ export function OnlineUsers() {
       >
         {/* Outer pulse ring */}
         <motion.span
-          className="absolute w-2.5 h-2.5 sm:w-3 sm:h-3 rounded-full bg-green-500/30"
+          className="absolute w-2.5 h-2.5 sm:w-3 sm:h-3 rounded-full bg-success/30"
           animate={{
             scale: [1, 1.8, 1],
             opacity: [0.7, 0, 0.7],
@@ -40,7 +40,7 @@ export function OnlineUsers() {
           }}
         />
         {/* Inner dot */}
-        <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-green-500 shadow-sm" />
+        <span className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full bg-success shadow-sm" />
       </motion.div>
       <motion.span
         key={count}
