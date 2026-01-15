@@ -47,34 +47,26 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
   };
 
   const handleGoogleSignIn = async () => {
-    // Open a blank tab immediately (still within the click gesture) to avoid popup blockers.
-    const popup = window.open("about:blank", "_blank", "noopener,noreferrer");
-    if (!popup) {
-      toast.error("Popup blocked. Please allow popups to continue with Google.");
-      return;
-    }
-
     setIsGoogleLoading(true);
-    let shouldCloseModal = false;
+    let redirectUrl: string | null = null;
 
     try {
       const { error, url } = await signInWithGoogle();
-
-      if (error || !url) {
-        popup.close();
-        toast.error(error?.message || "Google sign-in is not available right now.");
+      if (error) {
+        toast.error(error.message);
+        return;
+      }
+      if (!url) {
+        toast.error("Google sign-in is not available right now.");
         return;
       }
 
-      popup.location.href = url;
-      shouldCloseModal = true;
-      toast.info("Finish signing in with Google in the new tab.");
+      redirectUrl = url;
     } catch {
-      popup.close();
       toast.error("Failed to sign in with Google");
     } finally {
       setIsGoogleLoading(false);
-      if (shouldCloseModal) onClose();
+      if (redirectUrl) window.location.assign(redirectUrl);
     }
   };
 
