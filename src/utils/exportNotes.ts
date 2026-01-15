@@ -1,7 +1,7 @@
 import { Note } from "@/types/note";
 import { jsPDF } from "jspdf";
 
-const BRAND_NAME = "VidBrief";
+const BRAND_NAME = "SummarIQ";
 
 function toPlainText(input: string): string {
   if (!input) return "";
