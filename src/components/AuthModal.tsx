@@ -47,17 +47,34 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
   };
 
   const handleGoogleSignIn = async () => {
+    // Open a blank tab immediately (still within the click gesture) to avoid popup blockers.
+    const popup = window.open("about:blank", "_blank", "noopener,noreferrer");
+    if (!popup) {
+      toast.error("Popup blocked. Please allow popups to continue with Google.");
+      return;
+    }
+
     setIsGoogleLoading(true);
+    let shouldCloseModal = false;
+
     try {
-      const { error } = await signInWithGoogle();
-      if (error) {
-        toast.error(error.message);
+      const { error, url } = await signInWithGoogle();
+
+      if (error || !url) {
+        popup.close();
+        toast.error(error?.message || "Google sign-in is not available right now.");
+        return;
       }
-      // Don't close modal here - Google OAuth will redirect
-    } catch (error) {
+
+      popup.location.href = url;
+      shouldCloseModal = true;
+      toast.info("Finish signing in with Google in the new tab.");
+    } catch {
+      popup.close();
       toast.error("Failed to sign in with Google");
     } finally {
       setIsGoogleLoading(false);
+      if (shouldCloseModal) onClose();
     }
   };
 
@@ -86,7 +103,7 @@ export function AuthModal({ isOpen, onClose }: AuthModalProps) {
                   {isSignUp ? "Create Account" : "Welcome Back"}
                 </h2>
                 <p className="text-xs sm:text-sm text-muted-foreground mt-1">
-                  {isSignUp ? "Join SummarIQ today" : "Sign in to SummarIQ"}
+                  {isSignUp ? "Join VidBrief today" : "Sign in to VidBrief"}
                 </p>
               </div>
               <Button variant="ghost" size="icon" onClick={onClose} className="h-8 w-8 sm:h-9 sm:w-9">
