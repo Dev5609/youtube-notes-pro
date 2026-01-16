@@ -10,6 +10,30 @@ function toPlainText(input: string): string {
     input
       .replace(/\r\n/g, "\n")
       .replace(/\u00A0/g, " ")
+      // LaTeX formulas: \frac{a}{b} -> a/b
+      .replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, "($1/$2)")
+      // LaTeX subscript/superscript: x_{n} -> x_n, x^{2} -> x^2
+      .replace(/([_^])\{([^}]*)\}/g, "$1$2")
+      // Remove remaining backslash LaTeX commands like \times, \cdot, \sqrt, etc.
+      .replace(/\\(times|cdot|sqrt|sum|int|pi|alpha|beta|gamma|delta|theta|sigma|omega|infty|pm|mp|neq|leq|geq|approx|equiv|rightarrow|leftarrow|Rightarrow|Leftarrow)/g, (_, cmd) => {
+        const symbols: Record<string, string> = {
+          times: "×", cdot: "·", sqrt: "√", sum: "Σ", int: "∫",
+          pi: "π", alpha: "α", beta: "β", gamma: "γ", delta: "δ",
+          theta: "θ", sigma: "σ", omega: "ω", infty: "∞",
+          pm: "±", mp: "∓", neq: "≠", leq: "≤", geq: "≥",
+          approx: "≈", equiv: "≡", rightarrow: "→", leftarrow: "←",
+          Rightarrow: "⇒", Leftarrow: "⇐"
+        };
+        return symbols[cmd] || "";
+      })
+      // Remove dollar signs used for inline math: $x + y$ -> x + y
+      .replace(/\$([^$]+)\$/g, "$1")
+      // Remove double dollar signs for display math: $$formula$$ -> formula
+      .replace(/\$\$([^$]+)\$\$/g, "$1")
+      // Remove remaining backslashes before letters (cleanup)
+      .replace(/\\([a-zA-Z]+)/g, "$1")
+      // Remove curly braces
+      .replace(/[{}]/g, "")
       // Markdown links: [text](url) -> text
       .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
       // Inline code
