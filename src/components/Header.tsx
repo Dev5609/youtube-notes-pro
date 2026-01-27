@@ -26,7 +26,7 @@ export function Header({ onOpenHistory, onOpenAuth }: HeaderProps) {
       transition={{ duration: 0.5 }}
       className="w-full py-3 sm:py-4 px-4 sm:px-6"
     >
-      <div className="max-w-6xl mx-auto flex items-center justify-between">
+      <div className="w-full flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 sm:gap-3">
           <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-xl gradient-primary flex items-center justify-center shadow-soft">
             <BookOpen className="w-4 h-4 sm:w-5 sm:h-5 text-primary-foreground" />
